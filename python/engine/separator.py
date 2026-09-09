@@ -46,16 +46,30 @@ def _output_paths(file_path, output_dir):
     stem = _UNSAFE_RE.sub('_', os.path.splitext(os.path.basename(abs_path))[0])[:40]
     base = f'{stem}_{digest}'
     return (
-        os.path.join(output_dir, base + '.vocals.wav'),
-        os.path.join(output_dir, base + '.instrumental.wav'),
+        os.path.join(output_dir, base + '.vocals.mp3'),
+        os.path.join(output_dir, base + '.instrumental.mp3'),
     )
 
 
-def _write_wav(path, data, sr):
-    """先写临时文件再原子替换，避免中断留下半截 wav 被当成缓存命中"""
+def _write_mp3(path, data, sr):
+    """先写临时文件再原子替换，用 MP3 格式输出（兼容所有浏览器/平台）"""
+    import lameenc
+    # clip 到 [-1,1] 再转 int16
+    data = np.clip(data, -1.0, 1.0)
+    int16 = (data * 32767).astype(np.int16)
+
+    enc = lameenc.Encoder()
+    enc.set_bit_rate(128)
+    enc.set_in_sample_rate(sr)
+    enc.set_channels(1)
+    enc.set_quality(2)
+
+    mp3 = enc.encode(int16.tobytes())
+    mp3 += enc.flush()
+
     tmp = path + '.part'
-    # 临时名不是 .wav 结尾，必须显式指定格式，否则 soundfile 无法推断
-    sf.write(tmp, data, sr, format='WAV')
+    with open(tmp, 'wb') as f:
+        f.write(mp3)
     os.replace(tmp, path)
 
 
@@ -134,8 +148,8 @@ def _separate_with_demucs(file_path, vocal_path, instrumental_path):
     if instrumental.ndim > 1:
         instrumental = instrumental.mean(0)
 
-    _write_wav(vocal_path, vocal, sr)
-    _write_wav(instrumental_path, instrumental, sr)
+    _write_mp3(vocal_path, vocal, sr)
+    _write_mp3(instrumental_path, instrumental, sr)
 
     duration = len(vocal) / sr
     print(f'[Separator] Demucs done. Duration: {duration:.1f}s', flush=True)
@@ -170,8 +184,8 @@ def _separate_with_hpss(file_path, vocal_path, instrumental_path):
         # 转 mono
         instrumental = librosa.to_mono(instrumental)
 
-    _write_wav(vocal_path, vocal, sr)
-    _write_wav(instrumental_path, instrumental, sr)
+    _write_mp3(vocal_path, vocal, sr)
+    _write_mp3(instrumental_path, instrumental, sr)
 
     duration = len(vocal) / sr
     print(f'[Separator] HPSS done. Duration: {duration:.1f}s')

@@ -88,14 +88,14 @@ export function Player() {
         'canplay',
         () => {
           to.currentTime = t
-          if (wasPlaying) to.play().catch(() => {})
+          if (wasPlaying) to.play().catch(e => console.error('[Player] play after canplay failed:', e, to.src))
         },
         { once: true }
       )
       return
     }
     setCurrentTime(t)
-    if (wasPlaying) to.play().catch(() => {})
+    if (wasPlaying) to.play().catch(e => console.error('[Player] play failed:', e, to.src))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isVocalPlayback])
 
@@ -103,7 +103,7 @@ export function Player() {
     const audio = activeEl()
     if (!audio) return
     if (isPlaying) {
-      audio.play().catch(() => {})
+      audio.play().catch(e => console.error('[Player] play/pause effect play failed:', e, audio.src))
     } else {
       audio.pause()
     }

@@ -117,7 +117,7 @@ function App() {
         if (cancelled) return
 
         // 2. 登记两个播放源：伴奏（分离出的 instrumental）与原唱（原始 mp3 完整混音）
-        //    实际播哪个由底栏的原唱开关派生；都走 Python HTTP 端点以支持 Range 请求
+        //    都走 Python HTTP 端点以支持 Range 请求
         setAudioSources(
           `${baseUrl}/audio?path=${encodeURIComponent(sep.instrumental_path)}`,
           `${baseUrl}/audio?path=${encodeURIComponent(currentSong.path)}`

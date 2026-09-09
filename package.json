@@ -8,7 +8,7 @@
     "build": "vite build",
     "electron:dev": "concurrently \"vite\" \"wait-on tcp:5180 && cross-env NODE_ENV=development electron .\"",
     "electron:build": "vite build && electron-builder",
-    "package": "bash scripts/build-python-runtime.sh && npm run electron:build && bash scripts/sign-mac.sh && electron-builder --prepackaged release/mac-arm64",
+    "package": "bash scripts/build-python-runtime.sh && npm run build && electron-builder --dir && bash scripts/sign-mac.sh && electron-builder --prepackaged release/mac-arm64 && bash scripts/clean-release.sh",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -38,6 +38,9 @@
     "mac": {
       "target": ["dmg"],
       "category": "public.app-category.music"
+    },
+    "dmg": {
+      "writeUpdateInfo": false
     },
     "files": [
       "dist/**/*",
