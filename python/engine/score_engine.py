@@ -41,14 +41,24 @@ class ScoreEngine:
             }
 
         pitch_raw = self._calculate_pitch_score(user_pitches, baseline_pitches)
-        rhythm_raw = self._calculate_rhythm_score(user_onsets, lyric_timestamps)
         breath_raw = self._calculate_breath_score(user_pitches)
 
-        weighted = (
-            pitch_raw * self.weights['pitch']
-            + rhythm_raw * self.weights['rhythm']
-            + breath_raw * self.weights['breath']
-        )
+        has_rhythm_data = user_onsets and lyric_timestamps
+        if has_rhythm_data:
+            rhythm_raw = self._calculate_rhythm_score(user_onsets, lyric_timestamps)
+            weighted = (
+                pitch_raw * self.weights['pitch']
+                + rhythm_raw * self.weights['rhythm']
+                + breath_raw * self.weights['breath']
+            )
+        else:
+            # 无节奏数据时把节奏权重重新分配给音准和气息，避免 0 分拖低总分
+            remaining = self.weights['pitch'] + self.weights['breath']
+            weighted = (
+                pitch_raw * self.weights['pitch'] / remaining
+                + breath_raw * self.weights['breath'] / remaining
+            )
+            rhythm_raw = weighted
 
         return {
             'total': float(round(self._normalize_score(weighted), 1)),
@@ -100,6 +110,9 @@ class ScoreEngine:
         user_f = user_freqs[base_voiced]
         base_f = base_interp[base_voiced]
         cents = 1200 * np.log2(user_f / base_f)
+
+        # 八度等价：将 cents 归约到 [-600, 600]，唱高/低一个八度仍算命中
+        cents = ((cents + 600) % 1200) - 600
 
         # 命中率: |cents| < 50 视为命中 (quarter-tone 容差)
         hits = np.abs(cents) < 50
