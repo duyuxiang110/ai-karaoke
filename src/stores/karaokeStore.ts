@@ -18,6 +18,7 @@ interface KaraokeState {
   currentLyricIndex: number
 
   isRecording: boolean
+  isSeeking: boolean
   userPitches: PitchPoint[]
   baselinePitches: PitchPoint[]
   livePitch: PitchResult | null
@@ -38,6 +39,7 @@ interface KaraokeState {
   setPlaying: (playing: boolean) => void
   setCurrentTime: (t: number) => void
   setDuration: (d: number) => void
+  setSeeking: (seeking: boolean) => void
 
   setLyrics: (lyrics: LyricLine[]) => void
   setLyricSource: (source: LyricSource | null) => void
@@ -71,6 +73,7 @@ export const useKaraokeStore = create<KaraokeState>((set) => ({
   currentLyricIndex: -1,
 
   isRecording: false,
+  isSeeking: false,
   userPitches: [],
   baselinePitches: [],
   livePitch: null,
@@ -89,6 +92,7 @@ export const useKaraokeStore = create<KaraokeState>((set) => ({
     vocalUrl: null,
     currentTime: 0,
     isPlaying: false,
+    isSeeking: false,
     userPitches: [],
     score: null,
     lyrics: [],
@@ -111,13 +115,14 @@ export const useKaraokeStore = create<KaraokeState>((set) => ({
   setPlaying: (playing) => set({ isPlaying: playing }),
   setCurrentTime: (t) => set({ currentTime: t }),
   setDuration: (d) => set({ duration: d }),
+  setSeeking: (seeking) => set({ isSeeking: seeking }),
 
   setLyrics: (lyrics) => set({ lyrics }),
   setLyricSource: (source) => set({ lyricSource: source }),
   setCurrentLyricIndex: (i) => set({ currentLyricIndex: i }),
 
   setRecording: (recording) => set({ isRecording: recording }),
-  addUserPitch: (p) => set((s) => ({ userPitches: [...s.userPitches, p] })),
+  addUserPitch: (p) => set((s) => ({ userPitches: s.userPitches.concat(p) })),
   clearUserPitches: () => set({ userPitches: [] }),
   setBaselinePitches: (p) => set({ baselinePitches: p }),
   setLivePitch: (p) => set({ livePitch: p }),

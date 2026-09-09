@@ -164,6 +164,13 @@ async def calculate_score(req: ScoreRequest):
 
 # ─── WebSocket 实时音高流 ───
 
+def _voiced_in_window(window, sr):
+    """对窗口跑 DIO + StoneMask，返回浊音帧频率数组（供线程池调用）"""
+    _f0, t_axis = pw.dio(window, sr, f0_floor=80, f0_ceil=600, frame_period=20)
+    f0 = pw.stonemask(window, _f0, t_axis, sr)
+    return f0[f0 > 0]
+
+
 @app.websocket("/ws/pitch")
 async def pitch_stream(websocket: WebSocket):
     """
@@ -207,9 +214,10 @@ async def pitch_stream(websocket: WebSocket):
             # 取最近 MIN_SAMPLES 样本做 DIO
             window = audio_buffer[-MIN_SAMPLES:]
 
-            # 静音帧跳过 DIO
-            if rms < 0.015:
-                audio_buffer = audio_buffer[-2048:]  # 保留少量重叠
+            # 静音帧跳过 DIO（门限放低，软声/气声也要出红线）
+            if rms < 0.008:
+                # 保留 75% 重叠，静音结束后下一块即可出音高
+                audio_buffer = audio_buffer[-(MIN_SAMPLES - len(chunk)):]
                 timestamp = frame_count * len(chunk) / samples_per_sec
                 await websocket.send_json({
                     'type': 'pitch',
@@ -222,14 +230,12 @@ async def pitch_stream(websocket: WebSocket):
                 frame_count += 1
                 continue
 
-            # DIO + StoneMask
+            # DIO + StoneMask 放线程里跑：同步执行会阻塞收包循环，
+            # 音高消息到达变成突发，前端红线一跳一跳
             try:
-                _f0, t_axis = pw.dio(
-                    window, samples_per_sec,
-                    f0_floor=80, f0_ceil=600, frame_period=10,
+                voiced = await asyncio.to_thread(
+                    _voiced_in_window, window, samples_per_sec
                 )
-                f0 = pw.stonemask(window, _f0, t_axis, samples_per_sec)
-                voiced = f0[f0 > 0]
             except Exception:
                 voiced = np.array([])
 
@@ -252,8 +258,8 @@ async def pitch_stream(websocket: WebSocket):
                 'rms': round(rms, 4),
             })
 
-            # 保留末尾 2048 样本作为下一窗口重叠
-            audio_buffer = audio_buffer[-2048:]
+            # 保留 75% 重叠：下一块进来即凑满 MIN_SAMPLES，pitch 每块一条
+            audio_buffer = audio_buffer[-(MIN_SAMPLES - len(chunk)):]
             frame_count += 1
 
     except WebSocketDisconnect:

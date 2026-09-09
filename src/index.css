@@ -832,3 +832,38 @@ body {
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }
+
+/* ─── 后端启动失败诊断横幅 ─── */
+
+.diag-banner {
+  margin: 8px 16px 0;
+  padding: 10px 14px;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 10px;
+  background: rgba(239, 68, 68, 0.06);
+  flex-shrink: 0;
+}
+
+.diag-head {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--danger);
+  margin-bottom: 6px;
+}
+
+.diag-tail {
+  max-height: 120px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.diag-path {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}

@@ -3,6 +3,7 @@ const { spawn } = require('child_process')
 const path = require('path')
 const http = require('http')
 const fs = require('fs')
+const os = require('os')
 
 const PYTHON_PORT = 8765
 const PYTHON_DIR = path.join(__dirname, '..', 'python')
@@ -59,9 +60,28 @@ function resolvePythonEnv() {
   }
 }
 
+let pythonSpawnCount = 0
+let pythonLogStream = null
+let appQuitting = false
+let pythonLastExit = null
+let pythonLastExe = null
+
 function startPythonServer() {
   const { exe, script, cwd, env } = resolvePythonEnv()
-  console.log(`[Electron] Starting Python: ${exe} ${script}`)
+  pythonSpawnCount++
+  pythonLastExe = exe
+
+  const logDir = path.join(app.getPath('userData'), 'logs')
+  fs.mkdirSync(logDir, { recursive: true })
+  const logPath = path.join(logDir, 'python.log')
+  pythonLogStream = fs.createWriteStream(logPath, {
+    flags: pythonSpawnCount === 1 ? 'w' : 'a',
+  })
+  pythonLogStream.write(
+    `\n=== spawn #${pythonSpawnCount} ${new Date().toISOString()} exe=${exe} cwd=${cwd} ===\n`
+  )
+
+  console.log(`[Electron] Starting Python: ${exe} ${script} (log: ${logPath})`)
 
   pythonProcess = spawn(exe, [script, '--port', String(PYTHON_PORT)], {
     cwd,
@@ -69,22 +89,35 @@ function startPythonServer() {
     stdio: ['pipe', 'pipe', 'pipe'],
   })
 
-  pythonProcess.stdout.on('data', (data) => {
-    console.log(`[Python] ${data.toString().trim()}`)
-  })
-
-  pythonProcess.stderr.on('data', (data) => {
-    console.error(`[Python:ERR] ${data.toString().trim()}`)
-  })
+  const tee = (stream, level) => {
+    stream.on('data', (data) => {
+      const text = data.toString().trim()
+      if (level === 'err') console.error(`[Python:ERR] ${text}`)
+      else console.log(`[Python] ${text}`)
+      pythonLogStream.write(data)
+    })
+  }
+  tee(pythonProcess.stdout, 'out')
+  tee(pythonProcess.stderr, 'err')
 
   pythonProcess.on('exit', (code) => {
     console.log(`[Electron] Python process exited with code ${code}`)
+    pythonLastExit = code
+    if (pythonLogStream) pythonLogStream.write(`=== exited code=${code} ===\n`)
     pythonProcess = null
+    // 启动早期崩溃（端口被抢、瞬时失败等）自动重试，避免界面一直「AI 未连接」
+    if (!appQuitting && code !== 0 && pythonSpawnCount < 3) {
+      setTimeout(startPythonServer, 2000)
+    }
   })
 
   pythonProcess.on('error', (err) => {
     console.error(`[Electron] Failed to start Python: ${err.message}`)
+    if (pythonLogStream) pythonLogStream.write(`=== spawn error: ${err.message} ===\n`)
     pythonProcess = null
+    if (!appQuitting && pythonSpawnCount < 3) {
+      setTimeout(startPythonServer, 2000)
+    }
   })
 }
 
@@ -203,6 +236,31 @@ ipcMain.handle('python:status', async () => {
   })
 })
 
+// 「AI 未连接」时供界面直接展示原因，避免让用户自己翻日志
+ipcMain.handle('python:diagnostics', async () => {
+  const logPath = path.join(app.getPath('userData'), 'logs', 'python.log')
+  let tail = ''
+  try {
+    tail = fs.readFileSync(logPath, 'utf8').split('\n').slice(-40).join('\n')
+  } catch (err) {
+    tail = `(读取日志失败: ${err.message})`
+  }
+  return {
+    arch: process.arch,
+    platform: process.platform,
+    osRelease: os.release(),
+    exe: pythonLastExe,
+    spawnCount: pythonSpawnCount,
+    lastExit: pythonLastExit,
+    logPath,
+    tail,
+  }
+})
+
+// 系统代理（clash/v2ray 等）会把对 127.0.0.1 的请求也送进代理导致失败，
+// 表现为界面一直「AI 未连接」；loopback 必须直连
+app.commandLine.appendSwitch('proxy-bypass-list', '<-loopback>')
+
 app.whenReady().then(async () => {
   protocol.handle('karaoke', (request) => {
     const url = new URL(request.url)
@@ -235,11 +293,13 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
+    appQuitting = true
     killPythonServer()
     app.quit()
   }
 })
 
 app.on('before-quit', () => {
+  appQuitting = true
   killPythonServer()
 })

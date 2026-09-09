@@ -17,6 +17,7 @@ declare global {
       selectMP3File: () => Promise<string | null>
       selectLrcFile?: () => Promise<string | null>
       getPythonStatus: () => Promise<boolean>
+      getPythonDiagnostics?: () => Promise<any>
     }
   }
 }
@@ -43,17 +44,40 @@ function App() {
   const { connect, disconnect, sendPCM } = usePitchStream(baseUrl)
 
   const [scoring, setScoring] = useState(false)
+  const [diag, setDiag] = useState<any>(null)
 
   // Check Python server status
   useEffect(() => {
     const check = async () => {
-      const ok = await window.electronAPI?.getPythonStatus?.()
-      setPythonReady(!!ok)
+      if (window.electronAPI?.getPythonStatus) {
+        const ok = await window.electronAPI.getPythonStatus()
+        setPythonReady(!!ok)
+      } else {
+        try {
+          const res = await fetch(`${baseUrl}/health`)
+          setPythonReady(res.ok)
+        } catch {
+          setPythonReady(false)
+        }
+      }
     }
     check()
     const timer = setInterval(check, 3000)
     return () => clearInterval(timer)
-  }, [setPythonReady])
+  }, [setPythonReady, baseUrl])
+
+  // 长时间连不上时把失败原因直接展示在界面上，无需用户翻日志
+  useEffect(() => {
+    if (pythonReady) {
+      setDiag(null)
+      return
+    }
+    const timer = setTimeout(async () => {
+      const info = await window.electronAPI?.getPythonDiagnostics?.()
+      if (info) setDiag(info)
+    }, 45000)
+    return () => clearTimeout(timer)
+  }, [pythonReady])
 
   // When song is selected, run separation + baseline extraction
   useEffect(() => {
@@ -197,6 +221,17 @@ function App() {
           )}
         </div>
       </header>
+
+      {diag && (
+        <div className="diag-banner">
+          <div className="diag-head">
+            AI 后端启动失败 · {diag.arch} / {diag.platform} {diag.osRelease} ·
+            尝试 {diag.spawnCount} 次 · 最近退出码 {String(diag.lastExit)}
+          </div>
+          <pre className="diag-tail">{diag.tail}</pre>
+          <div className="diag-path">日志：{diag.logPath}</div>
+        </div>
+      )}
 
       <div className="app-body">
         <aside className="sidebar-left">

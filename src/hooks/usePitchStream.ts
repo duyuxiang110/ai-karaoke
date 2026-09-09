@@ -15,20 +15,44 @@ export function usePitchStream(baseUrl: string): UsePitchStreamReturn {
   const wsRef = useRef<WebSocket | null>(null)
   const getTime = usePlaybackClock()
 
-  // onmessage 的闭包在 connect 时就固定了，用 ref 才能读到最新的时钟
   const getTimeRef = useRef(getTime)
   getTimeRef.current = getTime
 
+  const shouldReconnectRef = useRef(false)
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const reconnectAttemptsRef = useRef(0)
+
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return
+    if (wsRef.current?.readyState === WebSocket.CONNECTING) return
+
+    shouldReconnectRef.current = true
 
     const wsUrl = baseUrl.replace('http', 'ws') + '/ws/pitch'
     const ws = new WebSocket(wsUrl)
     ws.binaryType = 'arraybuffer'
 
-    ws.onopen = () => setIsConnected(true)
-    ws.onclose = () => setIsConnected(false)
-    ws.onerror = () => setIsConnected(false)
+    ws.onopen = () => {
+      reconnectAttemptsRef.current = 0
+      setIsConnected(true)
+    }
+
+    ws.onclose = () => {
+      setIsConnected(false)
+      if (shouldReconnectRef.current) {
+        const delay = Math.min(500 * Math.pow(2, reconnectAttemptsRef.current), 4000)
+        reconnectAttemptsRef.current++
+        if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = setTimeout(() => {
+          reconnectTimerRef.current = null
+          if (shouldReconnectRef.current) connect()
+        }, delay)
+      }
+    }
+
+    ws.onerror = () => {
+      setIsConnected(false)
+    }
 
     ws.onmessage = (e: MessageEvent) => {
       try {
@@ -37,9 +61,7 @@ export function usePitchStream(baseUrl: string): UsePitchStreamReturn {
 
         store.setLivePitch(data)
 
-        if (data.frequency != null) {
-          // 用歌曲位置而不是服务端回传的 timestamp：基线音高在歌曲时间轴上，
-          // 两者必须同轴，否则音准打分的插值整体错位
+        if (data.frequency != null && data.frequency > 0 && !store.isSeeking) {
           store.addUserPitch({
             time: getTimeRef.current(),
             frequency: data.frequency,
@@ -54,6 +76,14 @@ export function usePitchStream(baseUrl: string): UsePitchStreamReturn {
   }, [baseUrl])
 
   const disconnect = useCallback(() => {
+    shouldReconnectRef.current = false
+    reconnectAttemptsRef.current = 0
+
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
+
     wsRef.current?.close()
     wsRef.current = null
     setIsConnected(false)
@@ -67,6 +97,8 @@ export function usePitchStream(baseUrl: string): UsePitchStreamReturn {
 
   useEffect(() => {
     return () => {
+      shouldReconnectRef.current = false
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
       wsRef.current?.close()
     }
   }, [])

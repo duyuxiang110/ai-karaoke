@@ -11,7 +11,9 @@ websockets==15.0.1
 requests==2.32.5
 
 # ─── 音频处理 ───
-numpy==2.0.2
+# numpy 必须保持 1.26.x：2.x 的 arm64 wheel 最低要求 macOS 14（minos 14.0），
+# macOS 12/13 的机器加载 C 扩展会直接 ImportError、后端起不来
+numpy==1.26.4
 scipy==1.13.1
 librosa==0.11.0
 soundfile==0.13.1
@@ -34,8 +36,10 @@ pyworld==0.3.5
 setuptools==75.8.0
 
 # ─── AI 分离模型 ───
-torch==2.8.0
-torchaudio==2.8.0
+# torch 必须保持 2.2.x：2.8 的 arm64 wheel 附带 minos 14.0 的 libomp.dylib，
+# macOS 12/13 上 libtorch_cpu 加载即失败；2.2.2 全二进制 minos ≤ 11.1
+torch==2.2.2
+torchaudio==2.2.2
 demucs==4.0.1
 julius==0.2.8
 einops==0.8.2

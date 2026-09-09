@@ -7,4 +7,5 @@ contextBridge.exposeInMainWorld('electronAPI', {
   selectMP3File: () => ipcRenderer.invoke('dialog:select-mp3'),
   selectLrcFile: () => ipcRenderer.invoke('dialog:select-lrc'),
   getPythonStatus: () => ipcRenderer.invoke('python:status'),
+  getPythonDiagnostics: () => ipcRenderer.invoke('python:diagnostics'),
 })
