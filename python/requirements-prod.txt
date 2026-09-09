@@ -1,0 +1,45 @@
+# 打包用依赖清单（scripts/build-python-runtime.sh 读取）
+# 版本与开发 venv 精确对齐：这里能跑，包进去就能跑。
+# 未列出的传递依赖交给 pip 解析。
+# 注意：pyworld 没有 macOS arm64 wheel，打包时在本机从 sdist 编译（需要 Xcode CLT）。
+
+# ─── Web 服务 ───
+fastapi==0.128.8
+uvicorn==0.39.0
+pydantic==2.13.5
+websockets==15.0.1
+requests==2.32.5
+
+# ─── 音频处理 ───
+numpy==2.0.2
+scipy==1.13.1
+librosa==0.11.0
+soundfile==0.13.1
+audioread==3.1.0
+pooch==1.9.0
+soxr==1.1.0
+lazy-loader==0.5
+msgpack==1.1.2
+decorator==5.3.1
+joblib==1.5.3
+scikit-learn==1.6.1
+threadpoolctl==3.6.0
+cffi==2.0.0
+pycparser==2.23
+
+# ─── 音高检测 ───
+pyworld==0.3.5
+# pyworld import 时需要 pkg_resources（由 setuptools 提供）；
+# venv 隐式自带 setuptools，--target 安装不会带，必须显式声明
+setuptools==75.8.0
+
+# ─── AI 分离模型 ───
+torch==2.8.0
+torchaudio==2.8.0
+demucs==4.0.1
+julius==0.2.8
+einops==0.8.2
+openunmix==1.3.0
+lameenc==1.8.1
+numba==0.60.0
+llvmlite==0.43.0

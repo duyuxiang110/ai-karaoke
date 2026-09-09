@@ -1,0 +1,23 @@
+# ─── Web 服务 ───
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# ─── 音频处理 ───
+numpy>=1.24.0
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# ─── 音高检测 (YIN) ───
+pyworld>=0.3.4
+
+# ─── 打分算法 ───
+scipy>=1.12.0
+
+# ─── 在线歌词检索 ───
+requests>=2.31.0
+
+# ─── AI 模型 (Step 3 安装，体积较大) ───
+# torch>=2.2.0
+# torchaudio>=2.2.0
+# demucs>=4.0.0

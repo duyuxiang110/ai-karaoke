@@ -1,0 +1,71 @@
+{
+  "name": "ai-karaoke",
+  "version": "1.0.0",
+  "description": "AI 智能 K 歌打分系统 - 离线桌面客户端",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "electron:dev": "concurrently \"vite\" \"wait-on tcp:5180 && cross-env NODE_ENV=development electron .\"",
+    "electron:build": "vite build && electron-builder",
+    "package": "bash scripts/build-python-runtime.sh && npm run electron:build && bash scripts/sign-mac.sh && electron-builder --prepackaged release/mac-arm64",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zustand": "^4.5.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^9.0.1",
+    "cross-env": "^7.0.3",
+    "electron": "43.1.0",
+    "electron-builder": "^25.0.5",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.ai-karaoke.app",
+    "productName": "AI Karaoke",
+    "directories": {
+      "output": "release"
+    },
+    "mac": {
+      "target": ["dmg"],
+      "category": "public.app-category.music"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "packaging/python-runtime",
+        "to": "python-runtime"
+      },
+      {
+        "from": "packaging/python-site",
+        "to": "python-site"
+      },
+      {
+        "from": "packaging/models",
+        "to": "models"
+      },
+      {
+        "from": "python",
+        "to": "python-src",
+        "filter": [
+          "ai_server.py",
+          "engine/**",
+          "routers/**",
+          "requirements-prod.txt"
+        ]
+      }
+    ]
+  }
+}

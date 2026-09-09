@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-electron/
+*.log
+.DS_Store
+
+# Python
+python/venv/
+python/__pycache__/
+python/**/*.pyc
+python/models/
+python/output/
+packaging/
+release/
