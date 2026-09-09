@@ -165,10 +165,10 @@ async def calculate_score(req: ScoreRequest):
 # ─── WebSocket 实时音高流 ───
 
 def _voiced_in_window(window, sr):
-    """对窗口跑 DIO + StoneMask，返回浊音帧频率数组（供线程池调用）"""
+    """对窗口跑 DIO + StoneMask，返回浊音帧频率数组和总帧数（供线程池调用）"""
     _f0, t_axis = pw.dio(window, sr, f0_floor=80, f0_ceil=600, frame_period=20)
     f0 = pw.stonemask(window, _f0, t_axis, sr)
-    return f0[f0 > 0]
+    return f0[f0 > 0], len(f0)
 
 
 @app.websocket("/ws/pitch")
@@ -214,8 +214,11 @@ async def pitch_stream(websocket: WebSocket):
             # 取最近 MIN_SAMPLES 样本做 DIO
             window = audio_buffer[-MIN_SAMPLES:]
 
-            # 静音帧跳过 DIO（门限放低，软声/气声也要出红线）
-            if rms < 0.008:
+            # 静音帧跳过 DIO：用整窗 RMS 而非当前块
+            # 当前块(2048样本=46ms)刚出声时 RMS 就过门限，
+            # 但 8192 窗里大部分还是静音，DIO 会在噪声上产生假音高
+            window_rms = float(np.sqrt(np.mean(window ** 2))) if len(window) > 0 else 0.0
+            if window_rms < 0.003:
                 # 保留 75% 重叠，静音结束后下一块即可出音高
                 audio_buffer = audio_buffer[-(MIN_SAMPLES - len(chunk)):]
                 timestamp = frame_count * len(chunk) / samples_per_sec
@@ -233,15 +236,17 @@ async def pitch_stream(websocket: WebSocket):
             # DIO + StoneMask 放线程里跑：同步执行会阻塞收包循环，
             # 音高消息到达变成突发，前端红线一跳一跳
             try:
-                voiced = await asyncio.to_thread(
+                voiced, total_frames = await asyncio.to_thread(
                     _voiced_in_window, window, samples_per_sec
                 )
             except Exception:
-                voiced = np.array([])
+                voiced, total_frames = np.array([]), 0
 
             timestamp = frame_count * len(chunk) / samples_per_sec
 
-            if len(voiced) > 0:
+            # 浊音帧占比过低说明窗口大部分是噪声/器乐残留，
+            # DIO 在这些帧上会出假音高（恒定 C5 的根因）
+            if total_frames > 0 and len(voiced) / total_frames >= 0.3 and len(voiced) > 0:
                 freq = float(np.median(voiced))
                 note, cents = freq_to_note_cents(freq)
             else:

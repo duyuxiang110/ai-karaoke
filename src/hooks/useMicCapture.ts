@@ -32,6 +32,9 @@ export function useMicCapture(): UseMicCaptureReturn {
 
       const ctx = new AudioContext({ sampleRate: 44100 })
       audioCtxRef.current = ctx
+      if (ctx.state === 'suspended') {
+        await ctx.resume()
+      }
 
       await ctx.audioWorklet.addModule('./worklets/pcm-processor.js')
 

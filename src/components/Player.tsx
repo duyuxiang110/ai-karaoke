@@ -139,9 +139,9 @@ export function Player() {
   return (
     <div className="player-bar">
       {instrumentalUrl && (
-        <audio ref={instRef} src={instrumentalUrl} preload="metadata" />
+        <audio ref={instRef} src={instrumentalUrl} preload="auto" />
       )}
-      {vocalUrl && <audio ref={vocalRef} src={vocalUrl} preload="metadata" />}
+      {vocalUrl && <audio ref={vocalRef} src={vocalUrl} preload="auto" />}
       <button
         className="btn-play"
         onClick={togglePlay}
