@@ -79,7 +79,7 @@ class ScoreEngine:
         """
         将用户音高与原唱基线在时间轴上对齐，计算每个帧的音分偏差。
         音分 (cents): 100 cents = 1 semitone, 1200 cents = 1 octave
-        偏差 < 50 cents 视为命中。
+        分级准确率: 偏差 0 → 1 分, ≥150 cents → 0 分, 线性过渡。
         返回 [0, 1] 的准确率。
         """
         if not user_pitches or not baseline_pitches:
@@ -114,9 +114,11 @@ class ScoreEngine:
         # 八度等价：将 cents 归约到 [-600, 600]，唱高/低一个八度仍算命中
         cents = ((cents + 600) % 1200) - 600
 
-        # 命中率: |cents| < 50 视为命中 (quarter-tone 容差)
-        hits = np.abs(cents) < 50
-        return float(np.mean(hits)) if len(hits) > 0 else 0.0
+        # 分级准确率: 0 cents=1 分, 150 cents=0 分, 线性过渡。
+        # 二值命中会让「半音内」全部满分，区分度不够；
+        # 分级后普通人（逐音偏差 ~±70 cents）raw≈0.6 → 映射 70 分
+        acc = np.clip(1.0 - np.abs(cents) / 150.0, 0.0, 1.0)
+        return float(np.mean(acc)) if len(acc) > 0 else 0.0
 
     # ─── 节奏分 ───
 
@@ -165,13 +167,24 @@ class ScoreEngine:
         if len(voiced_freqs) < 2:
             return 0.0
 
-        # 长音稳定性: 音高的变异系数 (CV = std/mean)
-        mean_f = np.mean(voiced_freqs)
-        std_f = np.std(voiced_freqs)
-        cv = std_f / mean_f if mean_f > 0 else 1.0
-
-        # CV < 0.05 视为优秀, CV > 0.2 视为差
-        stability = max(0.0, min(1.0, 1.0 - cv / 0.2))
+        # 长音稳定性: 浊音段内逐帧音高跳变的 cents 中位数。
+        # 不能用全程 std/mean——唱旋律必然跨音高，std 恒大会把稳定性压到 0，
+        # 总分永远 40 多；中位数不受换音处的大跳影响，只反映颤音/抖动
+        idx = np.flatnonzero(voiced)
+        jumps = []
+        run_start = 0
+        for i in range(1, len(idx) + 1):
+            if i == len(idx) or idx[i] != idx[i - 1] + 1:
+                run = voiced_freqs[run_start:i]
+                if len(run) >= 2:
+                    cents = 1200 * np.log2(run[1:] / run[:-1])
+                    jumps.extend(np.abs(cents).tolist())
+                run_start = i
+        if not jumps:
+            return 0.0
+        med_jump = float(np.median(jumps))
+        # 中位跳变 < 20 cents 视为优秀, > 100 cents 视为差
+        stability = max(0.0, min(1.0, 1.0 - med_jump / 100.0))
 
         # 气息断裂: 统计 voiced/unvoiced 切换次数
         transitions = np.diff(voiced.astype(int))
