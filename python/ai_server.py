@@ -165,10 +165,14 @@ async def calculate_score(req: ScoreRequest):
 # ─── WebSocket 实时音高流 ───
 
 def _voiced_in_window(window, sr):
-    """对窗口跑 DIO + StoneMask，返回浊音帧频率数组和总帧数（供线程池调用）"""
-    _f0, t_axis = pw.dio(window, sr, f0_floor=80, f0_ceil=600, frame_period=20)
+    """对窗口跑 DIO + StoneMask，返回浊音帧频率数组（供线程池调用）
+
+    frame_period 必须 ≤10：186ms 窗 + frame_period=20 时 DIO 边界效应
+    让 10 帧里只有 1 帧浊音，实测整条 WebSocket 一帧音高都回不去
+    """
+    _f0, t_axis = pw.dio(window, sr, f0_floor=80, f0_ceil=600, frame_period=10)
     f0 = pw.stonemask(window, _f0, t_axis, sr)
-    return f0[f0 > 0], len(f0)
+    return f0[f0 > 0]
 
 
 @app.websocket("/ws/pitch")
@@ -237,18 +241,17 @@ async def pitch_stream(websocket: WebSocket):
             # DIO + StoneMask 放线程里跑：同步执行会阻塞收包循环，
             # 音高消息到达变成突发，前端红线一跳一跳
             try:
-                voiced, total_frames = await asyncio.to_thread(
+                voiced = await asyncio.to_thread(
                     _voiced_in_window, window, samples_per_sec
                 )
             except Exception:
-                voiced, total_frames = np.array([]), 0
+                voiced = np.array([])
 
             timestamp = frame_count * len(chunk) / samples_per_sec
 
-            # 浊音帧占比过低说明窗口大部分是噪声/器乐残留，
-            # DIO 在这些帧上会出假音高（恒定 C5 的根因）
-            # 占比不能太高：轻唱/气声的浊音帧少，太高会把真唱滤掉导致红线断开
-            if total_frames > 0 and len(voiced) / total_frames >= 0.15 and len(voiced) > 0:
+            # 整窗 RMS 门已挡住静音窗；噪声窗实测 0/19 浊音帧不会出假音高，
+            # 不再加占比门——frame_period=20 时代 10 帧仅 1 帧浊音，占比门会把真唱全滤掉
+            if len(voiced) > 0:
                 freq = float(np.median(voiced))
                 note, cents = freq_to_note_cents(freq)
             else:
