@@ -217,8 +217,9 @@ async def pitch_stream(websocket: WebSocket):
             # 静音帧跳过 DIO：用整窗 RMS 而非当前块
             # 当前块(2048样本=46ms)刚出声时 RMS 就过门限，
             # 但 8192 窗里大部分还是静音，DIO 会在噪声上产生假音高
+            # 门限不能太高：轻唱/气声的整窗 RMS 偏低，太高会把真唱当静音
             window_rms = float(np.sqrt(np.mean(window ** 2))) if len(window) > 0 else 0.0
-            if window_rms < 0.003:
+            if window_rms < 0.0015:
                 # 保留 75% 重叠，静音结束后下一块即可出音高
                 audio_buffer = audio_buffer[-(MIN_SAMPLES - len(chunk)):]
                 timestamp = frame_count * len(chunk) / samples_per_sec
@@ -246,7 +247,8 @@ async def pitch_stream(websocket: WebSocket):
 
             # 浊音帧占比过低说明窗口大部分是噪声/器乐残留，
             # DIO 在这些帧上会出假音高（恒定 C5 的根因）
-            if total_frames > 0 and len(voiced) / total_frames >= 0.3 and len(voiced) > 0:
+            # 占比不能太高：轻唱/气声的浊音帧少，太高会把真唱滤掉导致红线断开
+            if total_frames > 0 and len(voiced) / total_frames >= 0.15 and len(voiced) > 0:
                 freq = float(np.median(voiced))
                 note, cents = freq_to_note_cents(freq)
             else:

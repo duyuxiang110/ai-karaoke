@@ -5,8 +5,8 @@ import type { PitchPoint } from '@/types'
 
 const PITCH_MIN = 80
 const PITCH_MAX = 600
-// 相邻音高点间隔超过该值视为中间没唱，红线断开；短于它的换气仍相连
-const USER_BREAK_GAP = 0.4
+// 相邻音高点间隔超过该值视为中间没唱，红线断开；短于它的换气和检测空洞仍相连
+const USER_BREAK_GAP = 1.0
 const WINDOW_SEC = 16
 
 function freqToY(freq: number, height: number): number {
