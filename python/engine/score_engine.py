@@ -79,46 +79,49 @@ class ScoreEngine:
         """
         将用户音高与原唱基线在时间轴上对齐，计算每个帧的音分偏差。
         音分 (cents): 100 cents = 1 semitone, 1200 cents = 1 octave
+        最近邻匹配基线浊音帧：不能对 frequency 跨静音线性插值，
+        否则静音段会插出幻影中间频率冤枉短语边缘帧；时差 >50ms 不评。
+        八度偏差给 60% 部分分（童声常比原唱高八度，全删会冤杀），不算满分。
         分级准确率: 偏差 0 → 1 分, ≥150 cents → 0 分, 线性过渡。
         返回 [0, 1] 的准确率。
         """
         if not user_pitches or not baseline_pitches:
             return 0.0
 
-        # 时间对齐: 线性插值 baseline 到 user 的时间点
         user_times = np.array([p['time'] for p in user_pitches])
         user_freqs = np.array([p['frequency'] for p in user_pitches])
         base_times = np.array([p['time'] for p in baseline_pitches])
         base_freqs = np.array([p['frequency'] for p in baseline_pitches])
 
-        # 过滤掉 unvoiced 帧 (frequency == 0 or None)
-        voiced_mask = (user_freqs > 0) & np.isfinite(user_freqs)
-        if not voiced_mask.any():
+        user_voiced = (user_freqs > 0) & np.isfinite(user_freqs)
+        base_voiced = (base_freqs > 0) & np.isfinite(base_freqs)
+        if not user_voiced.any() or not base_voiced.any():
             return 0.0
 
-        user_times = user_times[voiced_mask]
-        user_freqs = user_freqs[voiced_mask]
+        u_t = user_times[user_voiced]
+        u_f = user_freqs[user_voiced]
+        v_t = base_times[base_voiced]
+        v_f = base_freqs[base_voiced]
 
-        # 插值 baseline 到 user 时间点
-        base_interp = np.interp(user_times, base_times, base_freqs,
-                               left=0, right=0)
-        base_voiced = base_interp > 0
-        if not base_voiced.any():
+        # 最近邻基线浊音帧（基线帧间隔 10ms，50ms 容差足够）
+        idx = np.clip(np.searchsorted(v_t, u_t), 1, len(v_t) - 1)
+        left, right = idx - 1, idx
+        nearest = np.where(
+            np.abs(v_t[left] - u_t) <= np.abs(v_t[right] - u_t), left, right
+        )
+        valid = np.abs(v_t[nearest] - u_t) < 0.05
+        if not valid.any():
             return 0.0
 
-        # 计算音分偏差: cents = 1200 * log2(f1/f2)
-        user_f = user_freqs[base_voiced]
-        base_f = base_interp[base_voiced]
-        cents = 1200 * np.log2(user_f / base_f)
+        cents = 1200 * np.log2(u_f[valid] / v_f[nearest][valid])
 
-        # 八度等价：将 cents 归约到 [-600, 600]，唱高/低一个八度仍算命中
-        cents = ((cents + 600) % 1200) - 600
-
-        # 分级准确率: 0 cents=1 分, 150 cents=0 分, 线性过渡。
-        # 二值命中会让「半音内」全部满分，区分度不够；
-        # 分级后普通人（逐音偏差 ~±70 cents）raw≈0.6 → 映射 70 分
-        acc = np.clip(1.0 - np.abs(cents) / 150.0, 0.0, 1.0)
-        return float(np.mean(acc)) if len(acc) > 0 else 0.0
+        # 分级准确率: 本调全分; 八度偏差(|cents|≈1200)按 60% 部分分计
+        acc_direct = np.clip(1.0 - np.abs(cents) / 150.0, 0.0, 1.0)
+        acc_octave = 0.6 * np.clip(
+            1.0 - np.abs(np.abs(cents) - 1200.0) / 150.0, 0.0, 1.0
+        )
+        acc = np.maximum(acc_direct, acc_octave)
+        return float(np.mean(acc))
 
     # ─── 节奏分 ───
 
@@ -186,12 +189,15 @@ class ScoreEngine:
         # 中位跳变 < 20 cents 视为优秀, > 100 cents 视为差
         stability = max(0.0, min(1.0, 1.0 - med_jump / 100.0))
 
-        # 气息断裂: 统计 voiced/unvoiced 切换次数
+        # 气息断裂: 统计 voiced/unvoiced 切换次数，按演唱时长归一
+        # （除以帧数会对采样率敏感：同样唱法 10Hz 和 100Hz 输入分数不同）
         transitions = np.diff(voiced.astype(int))
         breaks = np.sum(transitions != 0)
-        break_rate = breaks / len(freqs) if len(freqs) > 0 else 1.0
-        # break_rate < 0.05 视为好
-        continuity = max(0.0, 1.0 - break_rate / 0.1)
+        times = np.array([p['time'] for p in user_pitches])
+        duration = float(times[-1] - times[0]) if len(times) > 1 else 0.0
+        breaks_per_sec = breaks / duration if duration > 1e-6 else 1.0
+        # <0.5 次/秒 视为好（正常短语换气），≥2 次/秒 视为断裂频繁
+        continuity = max(0.0, min(1.0, 1.0 - breaks_per_sec / 2.0))
 
         return 0.6 * stability + 0.4 * continuity
 
