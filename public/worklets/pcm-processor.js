@@ -4,7 +4,9 @@
  * 将浮点音频数据 [-1, 1] 转换为 16-bit PCM，
  * 按 2048 样本块通过 transferable ArrayBuffer 发送到主线程。
  *
- * 采样率由 AudioContext 决定（目标 44100Hz, mono）。
+ * 采样率由 AudioContext 决定（请求 44100Hz 但只是提示，实际值由
+ * useMicCapture 读 ctx.sampleRate 并上报后端）。输出永远是本 context
+ * 采样率下的 mono PCM，所以后端必须知道这个采样率才能把频率算对。
  * 渲染量子为 128 样本（AudioWorklet 标准）。
  */
 class PCMProcessor extends AudioWorkletProcessor {

@@ -26,6 +26,13 @@ None（未参评）而不是塞一个别的维度的综合分进去冒充节奏�
 
 时间戳不推进（没按播放就开唱）时数据不可用，直接判 0 分并在 warning 里
 说明原因，不给一个看起来像评分、实际毫无含义的数字。
+
+原唱基线为空、拿不到任何可演唱区间时，completion 返回 None（无从评估）
+而不是 100%：总分不再被折算，但必须如实说明它只反映已唱部分的质量。
+
+返回值里还带一个 diagnostics：音准对齐的诊断材料（对齐率、带符号中位
+偏差、两侧中位频率），只给后端写日志用、不进接口响应。光看「音准 40」
+分不出是唱得差还是两侧频率压根不是一个定义，这三个数能分开。
 """
 import numpy as np
 
@@ -39,10 +46,27 @@ W_BREATH = 0.20
 SCORE_CURVE = 0.85
 
 # ─── 音准 ───
-PITCH_MATCH_TOL = 0.05      # 与基线浊音帧的最大时间差；基线帧间隔 10ms
 PITCH_ZERO_CENTS = 150.0    # 偏差达到该音分数即 0 分（100 cents = 半音）
 OCTAVE_CENTS = 1200.0
 OCTAVE_PARTIAL = 0.6        # 八度偏差的部分分：童声常高八度，全删会冤杀
+
+# ─── 音准对齐（带约束 DTW）───
+PITCH_ALIGN_GRID = 0.05     # 基线重采样步长，与用户约 46ms 的帧率同量级
+PITCH_ALIGN_BAND = 1.0      # 允许的时间伸缩上限（秒）：容 tempo 差，不容整段平移
+PITCH_ALIGN_RUN_GAP = 1.0   # 用户帧断口超过该值即分段独立对齐（跨间奏不能连成一条路径）
+
+# 每偏离真实时间 1 秒附加的音分代价。
+#
+# 这个值卡得很紧，两头都不能让：太小则时间伸缩会被反向利用——
+# 路径可以滑回半秒去贴旋律里的邻音，于是「整体低 146.9 音分」（采样率
+# 错位的典型形态）被当成「差 35 音分」，实测能从 19 分骗到 59 分，比只偏
+# 90 音分的人还高，单调性彻底反了；太大则弹性对齐退化回死卡绝对秒数，
+# 唱慢一点就被判跑调（点 7/8 要修的就是这个）。
+#
+# 300 音分/秒 ≈ 一个小三度：在流行旋律里错开整整一秒，本来就该按差几个音
+# 来算。实测这个值下漂移到带宽边缘（0.9s）仍能对齐上（音准 98.7、
+# 中位偏差 0），而恒定错位再也贴不上邻音（19 分 < 偏 90 音分的 47 分）
+PITCH_ALIGN_TIME_PENALTY = 300.0
 
 # ─── 可演唱区间 ───
 BASE_FRAME_PAD = 0.005      # 基线 DIO frame_period=10ms，取半帧
@@ -52,7 +76,12 @@ DEFAULT_LINE_DUR = 3.0      # 歌词缺 end 且后面没有行时的兜底行长
 MAX_LINE_DUR = 15.0         # 单行时长上限，防止异常歌词吞掉整段间奏
 
 # ─── 用户演唱区间 ───
-USER_FRAME_PAD = 0.06       # 前端 2048 样本 @44100Hz ≈ 46ms 一帧，取半帧稍大
+# 前端 2048 样本一块，@44100Hz ≈ 46ms 一帧（@48000Hz ≈ 43ms），取半帧稍大。
+# 注意这里假定的是「一帧几十毫秒」这个量级：打分接口只收得到音高点、
+# 收不到采样率，所以没法跟着真实采样率自适应。采样率高到 96kHz 以上时
+# 一帧只剩 21ms，这个 pad 会偏大（把相邻帧过度合并）；真遇到了要么把
+# 采样率一起传过来，要么把前端的块长按采样率归一化
+USER_FRAME_PAD = 0.06
 USER_MERGE_GAP = 0.25       # 用户浊音帧间隔超过该值视为换气/断句
 
 # ─── 节奏 ───
@@ -79,10 +108,15 @@ BREATH_STABILITY_WEIGHT = 0.6
 
 class ScoreEngine:
 
+    def __init__(self):
+        # 本次打分的音准诊断（供后端日志取用），每次入口重置
+        self._pitch_diag = None
+
     # ─── 核心打分入口 ───
 
     def calculate_final_score(self, user_pitches, baseline_pitches,
                               user_onsets=None, lyric_timestamps=None):
+        self._pitch_diag = None
         user = self._voiced_points(user_pitches)
 
         # 全程静音 / 无浊音帧 → 0 分。没有 40 分保底，
@@ -130,8 +164,25 @@ class ScoreEngine:
             remaining = W_PITCH + W_BREATH
             quality = (pitch * W_PITCH + breath * W_BREATH) / remaining
 
-        total = quality * coverage ** SCORE_CURVE
-        completion = round(100.0 * coverage, 1)
+        if coverage is None:
+            # 基线与歌词都给不出「该唱哪些区间」，完成度无从评估。
+            # 不折算（等价于乘 1），但 completion 必须如实报 None，
+            # 并在 warning 里说清楚总分只反映已唱部分的质量
+            total = quality
+            completion = None
+            warning = (
+                '这首歌没有可比对的可演唱区间（原唱音高基线为空），'
+                '完成度无法评估，总分只反映已唱部分的质量'
+            )
+        else:
+            total = quality * coverage ** SCORE_CURVE
+            completion = round(100.0 * coverage, 1)
+            # 总分被完成度折算时必须解释原因，否则「音准气息都还行、
+            # 总分 1 分」看起来就像算错了
+            warning = None if coverage >= LOW_COMPLETION_HINT else (
+                f'只唱到全曲 {completion:.0f}% 的可演唱部分，'
+                f'总分已按完成度折算（总分 = 已唱内容质量 × 完成度）'
+            )
 
         return {
             'total': round(min(max(total, 0.0), 100.0), 1),
@@ -139,12 +190,9 @@ class ScoreEngine:
             'rhythm': None if rhythm is None else round(rhythm, 1),
             'breath': round(breath, 1),
             'completion': completion,
-            # 总分被完成度折算时必须解释原因，否则「音准气息都还行、
-            # 总分 1 分」看起来就像算错了
-            'warning': None if coverage >= LOW_COMPLETION_HINT else (
-                f'只唱到全曲 {completion:.0f}% 的可演唱部分，'
-                f'总分已按完成度折算（总分 = 已唱内容质量 × 完成度）'
-            ),
+            'warning': warning,
+            # 只进日志、不进接口响应：它用来解释分数，不是分数的一部分
+            'diagnostics': self._pitch_diag,
         }
 
     def _zero_result(self, warning, lyric_timestamps=None):
@@ -160,6 +208,7 @@ class ScoreEngine:
             'breath': 0.0,
             'completion': 0.0,
             'warning': warning,
+            'diagnostics': self._pitch_diag,
         }
 
     @staticmethod
@@ -338,12 +387,15 @@ class ScoreEngine:
 
         只算交集：在前奏里唱再多也不涨完成度，
         中途停下没唱的部分老老实实扣分。
+
+        拿不到任何可演唱区间时返回 None，不是 1.0：那是「无从评完成度」，
+        不是「唱完整了」。旧版在这里 return 1.0，注释写着「没有可评内容」，
+        实际却把只剩气息的质量分原封不动乘进总分 —— 什么都没得比反而
+        可能比真唱完整首但略有瑕疵的人分高。
         """
         total = sum(end - start for start, end in singable)
         if total <= 0:
-            # 基线和歌词都为空、拿不到任何可演唱区间信息时不乘完成度。
-            # 这种情况下音准也无从对齐，质量分本身已经说明问题
-            return 1.0
+            return None
 
         sung = self._user_phrases(user)
         covered = sum(end - start for start,
@@ -391,45 +443,250 @@ class ScoreEngine:
         只评价「可演唱区间」内的帧：在前奏 / 间奏里自己哼的不算演唱，
         既不该拿它抬分，也不该拿它扣分。
 
-        最近邻匹配基线浊音帧：不能对 frequency 跨静音线性插值，
-        否则静音段会插出幻影中间频率冤枉短语边缘帧；时差 >50ms 不评。
+        对齐用带约束的 DTW，不是「同一绝对秒数」的最近邻：原唱和用户的
+        速度不可能完全一致，而基线浊音帧 10ms 一个、密到「时间上最近」
+        永远只差几毫秒，50ms 容差根本拦不住什么 —— 唱慢 0.4s 的人会被
+        拿去和旋律里下一个音比，音准明明很好却被判成大片跑调（实测掉 37 分）。
 
-        分级准确率: 偏差 0 → 1 分，≥150 cents → 0 分，线性过渡；
-        八度偏差(|cents|≈1200)按 60% 部分分计，不算满分。
+        分级准确率: 偏差 0 → 1 分，≥150 cents → 0 分，线性过渡。
+        """
+        contours = self._pitch_contours(user, baseline_pitches, singable)
+        if contours is None:
+            return 0.0
+        u_t, u_c, v_t, v_c = contours
+
+        # 先按「用户唱的就是原唱那个调」对齐。这一趟的结果同时用来写诊断，
+        # 因为诊断要的是两侧频率的真实关系
+        cents = self._align_cents(u_t, u_c, v_t, v_c)
+        self._record_pitch_diag(u_t, u_c, v_t, v_c, cents)
+        raw = self._accuracy(cents)
+
+        # 八度宽容是整首歌的属性（童声高八度、男声低八度），不是逐帧的。
+        # 所以按「用户整体高/低一个八度」重跑一次对齐，取较高分，
+        # 但八度假设封顶 OCTAVE_PARTIAL。
+        #
+        # 不能把八度折叠直接塞进 DTW 的代价函数里：那样任何大幅恒定偏差
+        # 都能被就地解释成「八度差一点点」。整体低 146.9 音分（采样率
+        # 错位的典型形态）的帧会去贴半秒前的邻音，实测从 3 分骗到 69.5 分，
+        # 比只偏 90 音分的人还高 —— 单调性彻底反了。
+        # 封顶 0.6 也意味着本调已经能拿到 0.6 以上时八度假设不可能更好，
+        # 直接跳过，唱得好的常见情形只跑一趟 DTW
+        if raw < OCTAVE_PARTIAL:
+            for shift in (OCTAVE_CENTS, -OCTAVE_CENTS):
+                octaved = self._align_cents(u_t, u_c - shift, v_t, v_c)
+                raw = max(raw, OCTAVE_PARTIAL * self._accuracy(octaved))
+        return raw
+
+    @staticmethod
+    def _accuracy(cents):
+        """对齐后的音分差 → [0, 1] 准确率：0 偏差满分，≥PITCH_ZERO_CENTS 归零"""
+        if cents is None or not len(cents):
+            return 0.0
+        return float(np.mean(np.clip(
+            1.0 - np.abs(cents) / PITCH_ZERO_CENTS, 0.0, 1.0)))
+
+    def _record_pitch_diag(self, u_t, u_c, v_t, v_c, cents):
+        """记下音准诊断，供后端日志打印
+
+        「音准 40」既可能是唱得差，也可能是两侧 frequency 压根不是一个
+        定义（采样率对不上、单位不一致），光看一个分数永远分不出来。
+        所以三个数必须一起看：
+          · frames/aligned —— 有多少帧真的对上了基线。对齐率很低说明
+            时间轴错位（没按播放就开唱、采样率错导致窗长算错）
+          · med_cents —— 带符号的中位偏差。接近 0 但分数低 = 忽高忽低；
+            稳定偏一边 = 整体错位（-146.9 就是 48k 当 44.1k 解的特征值）。
+            只报绝对值这两种情况就分不出来了
+          · user_hz/base_hz —— 两侧中位频率。比值不是 1（或 2 / 0.5）
+            就说明频率本身被缩放过，而不是唱走音
+        """
+        aligned = 0 if cents is None else len(cents)
+        self._pitch_diag = {
+            'frames': int(len(u_t)),
+            'aligned': int(aligned),
+            'med_cents': round(float(np.median(cents)), 1) if aligned else None,
+            # u_c 就是 1200*log2(Hz)，反变换回去拿绝对频率
+            'user_hz': round(float(np.median(2.0 ** (u_c / 1200.0))), 1),
+            'base_hz': round(float(np.median(2.0 ** (v_c / 1200.0))), 1),
+        }
+
+    def _pitch_contours(self, user, baseline_pitches, singable):
+        """把两侧整形成可对齐的音分轮廓: (u_t, u_c, v_t, v_c)
+
+        基线 10ms 一帧、用户 46ms 一帧，分辨率差四倍多。不重采样的话
+        带宽内的候选会多出一个数量级，DTW 也分不清「停了多久」。
+        所以把基线压到 PITCH_ALIGN_GRID，两边帧率就在同一个量级上。
         """
         baseline = self._voiced_points(baseline_pitches)
         if not user or not baseline:
-            return 0.0
+            return None
 
         u_t = np.array([p['time'] for p in user])
         u_f = np.array([p['frequency'] for p in user])
-        if singable:
-            inside = self._inside_mask(u_t, singable)
-            u_t, u_f = u_t[inside], u_f[inside]
-        if not len(u_t):
-            return 0.0
-
         v_t = np.array([p['time'] for p in baseline])
         v_f = np.array([p['frequency'] for p in baseline])
 
-        # 最近邻基线浊音帧（基线帧间隔 10ms，50ms 容差足够）
-        idx = np.clip(np.searchsorted(v_t, u_t), 1, len(v_t) - 1)
+        if singable:
+            u_keep = self._inside_mask(u_t, singable)
+            v_keep = self._inside_mask(v_t, singable)
+            u_t, u_f = u_t[u_keep], u_f[u_keep]
+            v_t, v_f = v_t[v_keep], v_f[v_keep]
+        if not len(u_t) or not len(v_t):
+            return None
+
+        v_t, v_f = self._resample_contour(v_t, v_f, PITCH_ALIGN_GRID)
+        if not len(v_t):
+            return None
+
+        return u_t, 1200.0 * np.log2(u_f), v_t, 1200.0 * np.log2(v_f)
+
+    @staticmethod
+    def _resample_contour(times, freqs, grid):
+        """按 grid 步长取点，每个格点用最近的原始帧；原始帧断开处不补
+
+        只在已有帧上取最近邻，不跳静音插值 —— 插值会在换气处造出
+        幻影中间频率，冤枉短语边缘的帧。
+        """
+        targets = np.arange(times[0], times[-1] + grid * 0.5, grid)
+        idx = np.clip(np.searchsorted(times, targets), 1, len(times) - 1)
         left, right = idx - 1, idx
         nearest = np.where(
-            np.abs(v_t[left] - u_t) <= np.abs(v_t[right] - u_t), left, right
+            np.abs(times[left] - targets) <= np.abs(times[right] - targets),
+            left, right,
         )
-        valid = np.abs(v_t[nearest] - u_t) < PITCH_MATCH_TOL
-        if not valid.any():
-            return 0.0
+        # 落在空隙里的格点直接丢：宁可少几个基线点，也不能把换气当旋律
+        picks = np.unique(nearest[np.abs(times[nearest] - targets) <= grid])
+        return times[picks], freqs[picks]
 
-        cents = 1200 * np.log2(u_f[valid] / v_f[nearest][valid])
+    def _align_cents(self, u_t, u_c, v_t, v_c):
+        """分段跑 DTW，返回路径上「用户音分 - 基线音分」的数组"""
+        chunks = []
+        for start, end in self._alignment_runs(u_t):
+            cents = self._dtw_cents(u_t[start:end], u_c[start:end], v_t, v_c)
+            if len(cents):
+                chunks.append(cents)
+        if not chunks:
+            return None
+        return np.concatenate(chunks)
 
-        acc_direct = np.clip(1.0 - np.abs(cents) / PITCH_ZERO_CENTS, 0.0, 1.0)
-        acc_octave = OCTAVE_PARTIAL * np.clip(
-            1.0 - np.abs(np.abs(cents) - OCTAVE_CENTS) / PITCH_ZERO_CENTS,
-            0.0, 1.0,
-        )
-        return float(np.mean(np.maximum(acc_direct, acc_octave)))
+    @staticmethod
+    def _alignment_runs(u_t):
+        """按时间断口把用户轮廓切成若干段，各自独立对齐
+
+        跨间奏的两段演唱不能连成一条路径：前一段末尾和后一段开头
+        差了十几秒，带宽内根本没有可行的前驱，整条 DP 会断成 inf。
+        按 >PITCH_ALIGN_RUN_GAP 的断口切开，段内仍然保持单调。
+        """
+        runs = []
+        start = 0
+        for i in range(1, len(u_t)):
+            if u_t[i] - u_t[i - 1] > PITCH_ALIGN_RUN_GAP:
+                runs.append((start, i))
+                start = i
+        runs.append((start, len(u_t)))
+        return runs
+
+    def _dtw_cents(self, u_t, u_c, v_t, v_c):
+        """在一段用户轮廓上跑带约束 DTW，返回每对的音分差
+
+        约束四条，少一条就会被 DTW 反向利用：
+          · 带宽 |Δt| ≤ PITCH_ALIGN_BAND —— 累计漂移只容小幅 tempo 差，
+            整段平移几秒去凑旋律对不上
+          · 局部斜率：驻留（基线不推进）不得连续两次，于是任何一段
+            旋律最多被摊成两倍时长。没有这条 DTW 会把路径停在便宜的
+            音符上不动，一个从头到尾的长音能被摊成「跟着旋律走」
+          · 单调且不可回头 —— 同一段基线不能被重复利用
+          · 每个用户帧都必须落到一个基线帧上 —— 允许丢用户帧的话，
+            DTW 会把唱坏的那些帧全丢掉，音准分就变成「最好那几帧的均分」
+
+        代价 = |Δcents| + 每偏离真实时间一秒 PITCH_ALIGN_TIME_PENALTY 音分。
+        正则项让同样省力的几种对齐里选最贴近真实时间的那个。
+        八度宽容不放在这里（见 _calculate_pitch_score），否则任何大幅
+        恒定偏差都能被就地重解释成「八度差一点点」。
+        """
+        INF = float('inf')
+
+        # v_t 有序，|u_t[i] - v_t[j]| ≤ 带宽 的 j 是连续区间
+        lo = np.searchsorted(v_t, u_t - PITCH_ALIGN_BAND, side='left')
+        hi = np.searchsorted(v_t, u_t + PITCH_ALIGN_BAND, side='right') - 1
+        ok = hi >= lo
+        if not ok.any():
+            # 这一段整体离基线浊音帧超过一个带宽（唱在了原唱没唱的地方），无从评起
+            return np.array([])
+        u_t, u_c, lo, hi = u_t[ok], u_c[ok], lo[ok], hi[ok]
+
+        # 每行两个状态：A = 本格相对前一格推进了基线，B = 驻留在同一基线帧上。
+        # B 只能由 A 转出，等价于「不许连续驻留两次」，斜率就是这么卡住的
+        dist = []
+        for r in range(len(u_t)):
+            span = slice(int(lo[r]), int(hi[r]) + 1)
+            cost = np.abs(u_c[r] - v_c[span]) \
+                + PITCH_ALIGN_TIME_PENALTY * np.abs(u_t[r] - v_t[span])
+            if r == 0:
+                # 起点放宽到带宽内任意基线帧：用户可能不从第一个音唱起
+                dist.append((int(lo[r]), cost, np.full(len(cost), INF),
+                             np.zeros(len(cost), dtype=np.int8)))
+                continue
+
+            prev_lo, prev_a, prev_b, _ = dist[r - 1]
+            # 推进 1 格或 2 格 × 前驱是 A 还是 B，共四种。码位 = (k-1)*2 + 状态，
+            # argmin 平局时取第一个（推进 1 格 + 前驱 A），即最贴近真实时间的那个
+            stack = np.vstack([
+                self._shift(prev_lo, prev_a, lo[r], hi[r], 1, INF),
+                self._shift(prev_lo, prev_b, lo[r], hi[r], 1, INF),
+                self._shift(prev_lo, prev_a, lo[r], hi[r], 2, INF),
+                self._shift(prev_lo, prev_b, lo[r], hi[r], 2, INF),
+            ])
+            choice = np.argmin(stack, axis=0).astype(np.int8)
+            advance = cost + stack[choice, np.arange(len(cost))]
+            stall = cost + self._shift(prev_lo, prev_a, lo[r], hi[r], 0, INF)
+            dist.append((int(lo[r]), advance, stall, choice))
+
+        return self._trace_cents(dist, u_c, v_c)
+
+    @staticmethod
+    def _shift(prev_lo, prev_d, lo, hi, k, inf):
+        """取前驱行在绝对下标 j-k 处的值，对齐到当前行的 [lo, hi]
+
+        每行只存自己带宽内的切片，绝对下标 → 切片位置的换算必须
+        显式做，否则带宽随时间滑动时前驱会整体错位。
+        """
+        width = int(hi - lo + 1)
+        out = np.full(width, inf)
+        src = int(lo) - k - int(prev_lo)
+        a, b = max(src, 0), min(src + width, len(prev_d))
+        if b > a:
+            out[a - src:b - src] = prev_d[a:b]
+        return out
+
+    @staticmethod
+    def _trace_cents(dist, u_c, v_c):
+        """从末行代价最小的格子往回走，收齐路径上每对的音分差"""
+        _last_lo, last_a, last_b, _ = dist[-1]
+        pos = int(np.argmin(np.minimum(last_a, last_b)))
+        state = 0 if last_a[pos] <= last_b[pos] else 1
+        if not np.isfinite(last_a[pos] if state == 0 else last_b[pos]):
+            return np.array([])
+
+        cents = []
+        r = len(dist) - 1
+        while r >= 0:
+            row_lo, _, _, choice = dist[r]
+            j = int(row_lo) + pos
+            cents.append(u_c[r] - v_c[j])
+            if r == 0:
+                break
+            prev_lo = int(dist[r - 1][0])
+            if state == 1:
+                # 驻留格的前驱就是同一个 j 上的 A 态
+                pos, state = j - prev_lo, 0
+            else:
+                code = int(choice[pos])
+                pos = j - (1 + code // 2) - prev_lo
+                state = code % 2
+            if not 0 <= pos < len(dist[r - 1][1]):
+                break           # 理论上不会发生；真发生了就只用已回溯的那一段
+            r -= 1
+        return np.array(cents[::-1])
 
     # ─── 节奏分 ───
 

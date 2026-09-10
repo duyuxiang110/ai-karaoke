@@ -17,10 +17,13 @@ import os
 import sys
 import unittest
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine.score_engine import (  # noqa: E402
     ScoreEngine, SCORE_CURVE, W_BREATH, W_PITCH, W_RHYTHM,
+    PITCH_ALIGN_GRID, PITCH_ZERO_CENTS,
 )
 
 SONG_DURATION = 180.0
@@ -83,6 +86,25 @@ def make_tone(intervals, freq=300.0, step=USER_FRAME):
     return out
 
 
+def make_user_drift(intervals, max_delay, step=USER_FRAME):
+    """跟着原唱旋律唱，但速度跟不上：段首准点，段尾已经差了 max_delay 秒
+
+    K 歌场景的常态。每个音都唱对了，只是比原唱晚（max_delay>0）
+    或早（max_delay<0）一点落到时间轴上，偏差随时间线性累积。
+    """
+    out = []
+    for seg_start, seg_end in intervals:
+        span = max(seg_end - seg_start, 1e-9)
+        t = seg_start
+        while t < seg_end:
+            delay = max_delay * (t - seg_start) / span
+            # 取音高时刻限在本段内，别因为平移而伸到间奏里拿到 0
+            src = min(max(t - delay, seg_start), seg_end - 1e-6)
+            out.append({'time': round(t, 4), 'frequency': melody_freq(src)})
+            t += step
+    return out
+
+
 def make_lyrics(line_dur=4.0):
     """可演唱区间内每 line_dur 秒一句歌词"""
     lines = []
@@ -110,6 +132,8 @@ def reconcile(result):
         quality = (W_PITCH * result['pitch']
                    + W_RHYTHM * result['rhythm']
                    + W_BREATH * result['breath'])
+    if result['completion'] is None:
+        return quality      # 完成度无法评估时不折算，总分就等于质量分
     return quality * (result['completion'] / 100.0) ** SCORE_CURVE
 
 
@@ -231,6 +255,136 @@ class ScoreEngineTest(unittest.TestCase):
         )
         self.assertGreater(result['pitch'], 50.0)
         self.assertLess(result['pitch'], 80.0)
+
+    def test_恒定大幅偏差不能被八度宽容救回来(self):
+        # 采样率对不上时用户频率会被整体缩放：48k 的音频按 44.1k 解，
+        # 每个音都低 146.9 音分（差一个半音还多）。这既不是本调也不是
+        # 八度，分数必须比「只偏 90 音分」更低，不能反过来更高。
+        #
+        # 把八度折叠塞进 DTW 代价里就会出这种事：-146.9 的帧被拿去贴
+        # 半秒前的邻音，解释成「八度差 35 音分」，实测能骗到 69.5 分
+        detuned = self.engine.calculate_final_score(
+            user_pitches=make_user(SINGABLE, ratio=2 ** (-146.9 / 1200.0)),
+            baseline_pitches=self.baseline,
+            user_onsets=None,
+            lyric_timestamps=self.lyrics,
+        )
+        mild = self.engine.calculate_final_score(
+            user_pitches=make_user(SINGABLE, ratio=2 ** (90.0 / 1200.0)),
+            baseline_pitches=self.baseline,
+            user_onsets=None,
+            lyric_timestamps=self.lyrics,
+        )
+        self.assertLess(
+            detuned['pitch'], 25.0,
+            msg=f'整体差一个半音还有 {detuned["pitch"]} 分: {detuned}')
+        self.assertLess(
+            detuned['pitch'], mild['pitch'],
+            msg=f'偏差更大反而分更高: {detuned["pitch"]} vs {mild["pitch"]}')
+
+    def test_音准诊断_能一眼看出频率链路错位(self):
+        # 「音准 40」既可能是唱得差，也可能是两侧 frequency 压根不是一个
+        # 定义（采样率对不上、单位不一致）。诊断必须把这两种情况分开：
+        # 对齐率说明有没有大面积丢帧，两侧中位频率的比值说明有没有整体缩放
+        result = self.engine.calculate_final_score(
+            user_pitches=make_user(SINGABLE, ratio=2 ** (-146.9 / 1200.0)),
+            baseline_pitches=self.baseline,
+            user_onsets=None,
+            lyric_timestamps=self.lyrics,
+        )
+        diag = result['diagnostics']
+        self.assertIsNotNone(diag, msg='没给出音准诊断')
+        # 每个音都唱到了，不存在「帧被判无效而丢掉」
+        self.assertEqual(diag['frames'], diag['aligned'])
+        # 带符号中位偏差直接把这个常数暴露出来；只报绝对值就分不出
+        # 「忽高忽低」和「整体偏一边」，后者才是链路错位的特征
+        self.assertAlmostEqual(-146.9, diag['med_cents'], delta=5.0)
+        # 用户频率整体被压到基线的 0.919 倍（= 44100/48000）
+        self.assertAlmostEqual(
+            44100 / 48000, diag['user_hz'] / diag['base_hz'], delta=0.01)
+
+    def test_没唱或没基线时_诊断为空而不是编一个(self):
+        # 零分出口也得带上这个键，否则后端取诊断时要处处判空
+        for user in ([], make_tone([(1.0, 19.0)])):
+            result = self.engine.calculate_final_score(
+                user_pitches=user,
+                baseline_pitches=self.baseline,
+                user_onsets=None,
+                lyric_timestamps=self.lyrics,
+            )
+            self.assertIn('diagnostics', result)
+        empty = self.engine.calculate_final_score(
+            user_pitches=make_user(SINGABLE),
+            baseline_pitches=[],
+            user_onsets=None,
+            lyric_timestamps=None,
+        )
+        self.assertIsNone(empty['diagnostics'])
+
+    # ─── 音准对齐：允许时间伸缩，不死卡绝对秒数 ───
+
+    def test_唱得准但越唱越慢_音准不该被判跑调(self):
+        # 用户每个音都唱对了，只是比原唱晚了最多 0.45s（差不到一个音）。
+        # 死卡绝对秒数的最近邻匹配拿 t 时刻的原唱音去比用户 t 时刻的音，
+        # 旋律早就走到下一个音了，于是「音准很好」被算成大片跑调帧
+        for delay in (0.45, -0.45):
+            result = self.engine.calculate_final_score(
+                user_pitches=make_user_drift(SINGABLE, max_delay=delay),
+                baseline_pitches=self.baseline,
+                user_onsets=None,
+                lyric_timestamps=self.lyrics,
+            )
+            self.assertGreaterEqual(
+                result['pitch'], 85.0,
+                msg=f'偏移 {delay}s 时音准被误判: {result}')
+
+    def test_恒定长音不能被时间伸缩救回来(self):
+        # DTW 会主动寻找最省力的对应关系，必须确认它不会把
+        # 「从头到尾一个音」拉伸成「跟着旋律走」
+        result = self.engine.calculate_final_score(
+            user_pitches=make_tone(SINGABLE, freq=BASE_FREQ),
+            baseline_pitches=self.baseline,
+            user_onsets=None,
+            lyric_timestamps=self.lyrics,
+        )
+        self.assertLess(result['pitch'], 45.0, msg=f'长音蹭分: {result}')
+
+    def test_偏移超出对齐带宽_不强行平移凑分(self):
+        # 晚了 3 秒才开口，唱的已经是完全不同的段落。时间伸缩只容下
+        # 小幅 tempo 差，不能把整段旋律平移过去凑分。
+        #
+        # 这条直接测 _dtw_cents 而不走端到端：夹具旋律是 7 个音循环、
+        # 周期 3.5s，平移 3s 恰好等于「早半拍」，同一个音真的就落在
+        # 1s 带宽里，DTW 那样配对是合法的，端到端根本测不出带宽。
+        # 所以换成一路向上、绝不重复的轮廓：平移出带宽之后，
+        # 再没有任何便宜的对应关系可捡。
+        n = 200
+        v_t = np.arange(n) * PITCH_ALIGN_GRID
+        v_c = np.arange(n) * 40.0        # 每格升 40 音分，即 800 音分/秒
+        u_c = v_c.copy()                 # 音一个不差
+
+        cents = self.engine._dtw_cents(v_t + 3.0, u_c, v_t, v_c)
+        self.assertGreater(len(cents), 0, msg='带宽内一个候选都没有，测不出东西')
+        # 带宽只有 ±1s，最省力的配对也差了 1600 音分，远在 0 分线之外
+        self.assertGreater(
+            float(np.min(np.abs(cents))), PITCH_ZERO_CENTS,
+            msg=f'3s 偏移被带宽外的基线救回: {np.min(np.abs(cents))}')
+
+        # 同样的轮廓、偏移收进带宽内就必须能对上，
+        # 否则上一条只是在证明「DTW 什么都不认」
+        cents = self.engine._dtw_cents(v_t + 0.4, u_c, v_t, v_c)
+        self.assertLess(float(np.median(np.abs(cents))), PITCH_ZERO_CENTS)
+
+    def test_准点演唱_对齐改动不能让分数反而变低(self):
+        # 完全跟着原唱唱时，弹性对齐的最优路径就是恒等映射，
+        # 结果必须与严格最近邻一致，不能因为换算法而凭空掉分
+        result = self.engine.calculate_final_score(
+            user_pitches=make_user(SINGABLE),
+            baseline_pitches=self.baseline,
+            user_onsets=None,
+            lyric_timestamps=self.lyrics,
+        )
+        self.assertGreaterEqual(result['pitch'], 95.0)
 
     # ─── 节奏：起音提取 + one onset ↔ one lyric ───
 
@@ -371,6 +525,56 @@ class ScoreEngineTest(unittest.TestCase):
             self.assertAlmostEqual(
                 reconcile(result), result['total'], delta=1.0,
                 msg=f'总分对不上账: {result}')
+
+    # ─── 完成度无法评估时不能假装唱完整了 ───
+
+    def test_没有可演唱区间数据_完成度报无法评估(self):
+        # 基线和歌词都为空 → 拿不到任何「该唱什么」的信息。
+        # 旧行为是 coverage = 1.0，等于宣称「你唱完整了」，
+        # 于是只剩气息的质量分照样乘 1 进了总分，
+        # 注释里写「没有可评内容」、实际却给了满分完成度
+        result = self.engine.calculate_final_score(
+            user_pitches=make_user(SINGABLE),
+            baseline_pitches=[],
+            user_onsets=None,
+            lyric_timestamps=None,
+        )
+        self.assertIsNone(result['completion'])
+        self.assertTrue(result['warning'])
+        self.assertIn('完成度', result['warning'])
+        self.assertAlmostEqual(reconcile(result), result['total'], delta=0.5)
+
+    def test_基线全静音且无歌词_完成度同样无法评估(self):
+        # 基线有帧但全未浊音（mask_to_singing_segments 把所有帧都掩了），
+        # 一样得不出可演唱区间，不能归到 100%
+        silent = [{'time': round(k * BASE_FRAME, 4), 'frequency': 0.0}
+                  for k in range(int(SONG_DURATION / BASE_FRAME))]
+        result = self.engine.calculate_final_score(
+            user_pitches=make_user(SINGABLE),
+            baseline_pitches=silent,
+            user_onsets=None,
+            lyric_timestamps=None,
+        )
+        self.assertIsNone(result['completion'])
+        self.assertIsNone(result['rhythm'])
+        self.assertTrue(result['warning'])
+
+    def test_完成度无法评估时_不能比唱完整首得分高(self):
+        # 旧口径下「什么都没得比」反而拿到 coverage=1.0，
+        # 可能比真唱完整首但略有瑕疵的人分还高 —— 逆向激励
+        no_data = self.engine.calculate_final_score(
+            user_pitches=make_user(SINGABLE),
+            baseline_pitches=[],
+            user_onsets=None,
+            lyric_timestamps=None,
+        )
+        full = self.engine.calculate_final_score(
+            user_pitches=make_user(SINGABLE, ratio=2 ** (90 / 1200.0)),
+            baseline_pitches=self.baseline,
+            user_onsets=None,
+            lyric_timestamps=self.lyrics,
+        )
+        self.assertLess(no_data['total'], full['total'])
 
     # ─── 时间轴没推进（没按播放就开唱）───
 

@@ -1,8 +1,13 @@
 import { useState, useRef, useCallback } from 'react'
 import { useKaraokeStore } from '@/stores/karaokeStore'
 
+// 希望拿到的采样率。只是个希望：AudioContext 构造参数里的 sampleRate
+// 按规范就是「提示」，浏览器给不了会静默用自己的（常见 48000）
+const REQUESTED_SAMPLE_RATE = 44100
+
 interface UseMicCaptureReturn {
-  start: (onPCM: (buffer: ArrayBuffer) => void) => Promise<void>
+  /** 启动采集，返回 AudioContext 的**真实**采样率（后端跑 DIO 必须用它） */
+  start: (onPCM: (buffer: ArrayBuffer) => void) => Promise<number>
   stop: () => void
   isRecording: boolean
   error: string | null
@@ -25,13 +30,29 @@ export function useMicCapture(): UseMicCaptureReturn {
           noiseSuppression: false,
           autoGainControl: false,
           channelCount: 1,
-          sampleRate: 44100,
+          sampleRate: REQUESTED_SAMPLE_RATE,
         },
       })
       streamRef.current = stream
 
-      const ctx = new AudioContext({ sampleRate: 44100 })
+      // 一律以 ctx.sampleRate 为准，不假定请求生效了。采样率一旦对不上，
+      // 后端拿 44100 去解 48k 的 PCM，所有频率被整体压到 0.919 倍
+      // （-146.9 音分，差一个半音还多），音准分直接废掉 —— 而且从分数上
+      // 完全看不出来，只会以为唱得差
+      let ctx: AudioContext
+      try {
+        ctx = new AudioContext({ sampleRate: REQUESTED_SAMPLE_RATE })
+      } catch {
+        // 不支持指定采样率（部分 Safari / 旧内核），那就用系统给的
+        ctx = new AudioContext()
+      }
       audioCtxRef.current = ctx
+      if (ctx.sampleRate !== REQUESTED_SAMPLE_RATE) {
+        console.warn(
+          `[useMicCapture] AudioContext 实际采样率 ${ctx.sampleRate}，` +
+          `非请求的 ${REQUESTED_SAMPLE_RATE}；按实际值上报后端`
+        )
+      }
       if (ctx.state === 'suspended') {
         await ctx.resume()
       }
@@ -54,9 +75,12 @@ export function useMicCapture(): UseMicCaptureReturn {
 
       useKaraokeStore.getState().setRecording(true)
       setIsRecording(true)
+      return ctx.sampleRate
     } catch (err: any) {
       setError(err.message || '麦克风启动失败')
       console.error('[useMicCapture] Error:', err)
+      // 没起成也得给个数：调用方拿它去建 WebSocket，不能返回 undefined
+      return REQUESTED_SAMPLE_RATE
     }
   }, [])
 

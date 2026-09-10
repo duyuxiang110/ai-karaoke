@@ -185,8 +185,14 @@ function App() {
     // 冻结的 currentTime，不自动播放就开唱的话几百帧会全盖同一个时间戳，
     // 后端既算不出完成度也对不上歌词，只能判 0 分
     setPlaying(true)
-    connect()
-    await startMic(sendPCM)
+    // 先起麦克风拿到 AudioContext 的真实采样率，再带着它建连。
+    // 顺序反过来就只能让后端猜 44100，而 AudioContext({sampleRate}) 按规范
+    // 只是提示 —— 猜错的话所有用户频率被整体缩放，音准分直接失真。
+    // 建连期间 worklet 已经出的那一两块 PCM 会被 sendPCM 丢掉（socket 未
+    // OPEN），但本地握手 ~1ms、第一块要 ~46ms 才到，实际上丢不了；
+    // 采集时刻队列也只在真发出去时才入队，FIFO 不会因此错位
+    const sampleRate = await startMic(sendPCM)
+    connect(sampleRate)
   }, [clearUserPitches, setScore, setPlaying, connect, startMic, sendPCM])
 
   const handleStopSinging = useCallback(async () => {
