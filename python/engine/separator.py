@@ -1,23 +1,21 @@
 """
 伴奏分离引擎
-优先使用 Demucs (htdemucs) 高质量分离，未安装或失败时 fallback 到 librosa HPSS + 中置声道去除
+统一使用 Demucs (htdemucs) 四轨分离：vocals 作为人声，drums+bass+other 合成伴奏。
+不再提供 HPSS 等自动 fallback —— 环境缺失时直接报错，
+保证所有机器对同一首歌得到完全一致的分离结果。
 """
 import hashlib
 import os
 import re
 import sys
 import numpy as np
-import librosa
 import soundfile as sf
 
-try:
-    import torch
-    import torchaudio
-    from demucs.pretrained import get_model
-    from demucs.apply import apply_model
-    DEMUCS_AVAILABLE = True
-except ImportError:
-    DEMUCS_AVAILABLE = False
+# Demucs 是本项目唯一的分离引擎，直接硬依赖：缺失就让导入失败，绝不静默换算法
+import torch
+import torchaudio
+from demucs.pretrained import get_model
+from demucs.apply import apply_model
 
 # 打包态由 electron 注入 KARAOKE_OUTPUT_DIR 指向可写的用户数据目录，
 # 避免往只读的 app Resources 里写分离产物；dev 不设置时保持仓库内默认目录
@@ -38,7 +36,8 @@ def _output_paths(file_path, output_dir):
     abs_path = os.path.abspath(file_path)
     try:
         stat = os.stat(abs_path)
-        identity = f'{abs_path}|{stat.st_size}|{int(stat.st_mtime)}'
+        # st_mtime_ns 精确到纳秒，避免同一秒内替换文件时错误复用旧分离产物
+        identity = f'{abs_path}|{stat.st_size}|{stat.st_mtime_ns}'
     except OSError:
         identity = abs_path
 
@@ -73,9 +72,26 @@ def _write_mp3(path, data, sr):
     os.replace(tmp, path)
 
 
+def check_demucs():
+    """
+    启动时校验 Demucs 环境，并打印 torch/torchaudio 版本，
+    便于排查「同一首歌在不同机器上分离结果不一致」的问题。
+    可用返回 True，不可用返回 False（调用方据此抛出明确错误）。
+    """
+    try:
+        print('[Separator] Demucs available', flush=True)
+        print(f'[Separator] Torch: {torch.__version__}', flush=True)
+        print(f'[Separator] Torchaudio: {torchaudio.__version__}', flush=True)
+        return True
+    except Exception as e:
+        print(
+            f'[Separator] Demucs unavailable: {e}', file=sys.stderr, flush=True)
+        return False
+
+
 def separate_vocals(file_path, output_dir=None):
     """
-    分离人声和伴奏
+    分离人声和伴奏（仅 Demucs，无 fallback）
     返回: (vocal_path, instrumental_path, sample_rate, duration)
     """
     if output_dir is None:
@@ -86,17 +102,11 @@ def separate_vocals(file_path, output_dir=None):
 
     if os.path.exists(vocal_path) and os.path.exists(instrumental_path):
         info = sf.info(vocal_path)
-        print(f'[Separator] Reusing separation: {os.path.basename(vocal_path)}', flush=True)
+        print(
+            f'[Separator] Reusing Demucs separation: {os.path.basename(vocal_path)}', flush=True)
         return vocal_path, instrumental_path, info.samplerate, info.frames / info.samplerate
 
-    if DEMUCS_AVAILABLE:
-        try:
-            return _separate_with_demucs(file_path, vocal_path, instrumental_path)
-        except Exception as e:
-            print(f'[Separator] Demucs failed: {e}', file=sys.stderr, flush=True)
-            print('[Separator] Falling back to HPSS...', flush=True)
-
-    return _separate_with_hpss(file_path, vocal_path, instrumental_path)
+    return _separate_with_demucs(file_path, vocal_path, instrumental_path)
 
 
 def _separate_with_demucs(file_path, vocal_path, instrumental_path):
@@ -156,37 +166,10 @@ def _separate_with_demucs(file_path, vocal_path, instrumental_path):
     return vocal_path, instrumental_path, sr, duration
 
 
-def _separate_with_hpss(file_path, vocal_path, instrumental_path):
-    """
-    Fallback: librosa HPSS + 中置声道去除
-    立体声歌曲中，人声通常在中央 (L≈R)，用 L-R 可去除人声得到伴奏
-    """
-    print('[Separator] Demucs not available, using HPSS + center removal...')
-
-    y, sr = librosa.load(file_path, sr=44100, mono=False)
-
-    if y.ndim == 1:
-        # Mono: HPSS 分离谐波/打击
-        harmonic, percussive = librosa.effects.hpss(y)
-        vocal = harmonic
-        instrumental = y - harmonic  # 原曲减去谐波部分
-    else:
-        # Stereo: 中置声道去除 (L-R) 得到无伴奏，HPSS 得到人声
-        # 人声提取: HPSS 谐波分量
-        y_mono = librosa.to_mono(y)
-        harmonic, _ = librosa.effects.hpss(y_mono)
-        vocal = harmonic
-
-        # 伴奏: 原曲 - 人声（近似）
-        # 更好的方法: 中置去除
-        minus = (y[0] - y[1]) / 2
-        instrumental = np.stack([minus, -minus], axis=0)
-        # 转 mono
-        instrumental = librosa.to_mono(instrumental)
-
-    _write_mp3(vocal_path, vocal, sr)
-    _write_mp3(instrumental_path, instrumental, sr)
-
-    duration = len(vocal) / sr
-    print(f'[Separator] HPSS done. Duration: {duration:.1f}s')
-    return vocal_path, instrumental_path, sr, duration
+# 启动即校验 Demucs：缺失就直接抛明确错误，绝不静默退回 HPSS 之类的其它算法，
+# 从根源消除跨机器分离结果不一致（伴奏里混进人声 / 人声里没有 vocals）的问题
+if not check_demucs():
+    raise RuntimeError(
+        'Demucs is unavailable. '
+        'Please install the required Demucs environment.'
+    )

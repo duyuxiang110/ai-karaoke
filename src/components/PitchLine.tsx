@@ -5,8 +5,11 @@ import type { PitchPoint } from '@/types'
 
 const PITCH_MIN = 80
 const PITCH_MAX = 600
-// 相邻音高点间隔超过该值视为中间没唱，红线断开；短于它的换气和检测空洞仍相连
-const USER_BREAK_GAP = 0.18
+// 麦克风超过 200ms 没检测到有效音高就断线，避免停唱后红线还拖着走
+const USER_BREAK_GAP = 0.2
+// 麦克风检测链路（AudioContext→analyser→pitch→JS）有缓冲延迟，
+// 允许实时红线最多超前播放位置这么多，否则当前帧刚检测到的点可能画不出来
+const REALTIME_DRAW_AHEAD = 0.05
 const WINDOW_SEC = 16
 
 function freqToY(freq: number, height: number): number {
@@ -28,6 +31,25 @@ function lowerBound(points: PitchPoint[], time: number): number {
     else hi = mid
   }
   return lo
+}
+
+// 实时曲线只能用「过去 + 当前」点做中值平滑，绝不能偷看 i+1 / i+2，
+// 否则等于把未来的音高混进当前帧，红线会提前画出还没唱到的走势
+function getSmoothFrequency(
+  points: PitchPoint[],
+  index: number,
+  mode: 'none' | 'past'
+): number {
+  const current = points[index]?.frequency ?? 0
+  if (current <= 0) return current
+  if (mode === 'none') return current
+  const values: number[] = []
+  for (let j = -2; j <= 0; j++) {
+    const f = points[index + j]?.frequency
+    if (f && f > 0) values.push(f)
+  }
+  values.sort((a, b) => a - b)
+  return values[Math.floor(values.length / 2)]
 }
 
 export function PitchLine() {
@@ -57,8 +79,9 @@ export function PitchLine() {
       height: number,
       color: string,
       lineWidth: number,
-      smooth = false,
-      breakGap = 0
+      smooth: 'none' | 'past' = 'none',
+      breakGap = 0,
+      maxTime = Infinity
     ): { x: number; y: number; t: number } | null => {
       if (points.length === 0) return null
       ctx.beginPath()
@@ -72,20 +95,12 @@ export function PitchLine() {
       const from = Math.max(0, lowerBound(points, tStart) - 2)
       for (let i = from; i < points.length; i++) {
         const p = points[i]
-        if (p.time > tEnd) continue
+        // 点已按时间升序：超过硬上限 maxTime 或窗口右边界 tEnd 都可以直接 break
+        // 实时红线绝不能画到当前播放位置之后
+        if (p.time > maxTime) break
+        if (p.time > tEnd) break
         if (p.frequency > 0) {
-          let freq = p.frequency
-          if (smooth) {
-            // 5 点中值滤波（i-2..i+2），抗八度误差和单点跳变
-            const vals: number[] = [freq]
-            for (let j = -2; j <= 2; j++) {
-              if (j === 0) continue
-              const f = points[i + j]?.frequency
-              if (f && f > 0) vals.push(f)
-            }
-            vals.sort((a, b) => a - b)
-            freq = vals[Math.floor(vals.length / 2)]
-          }
+          const freq = getSmoothFrequency(points, i, smooth)
           const x = timeToX(p.time)
           const y = freqToY(freq, height)
           if (p.time >= tStart) {
@@ -154,15 +169,17 @@ export function PitchLine() {
         return ((t - tStart) / WINDOW_SEC) * w
       }
 
-      // 基线音高（原唱）
-      drawCurve(bp, tStart, tEnd, timeToX, h, 'rgba(99, 102, 241, 0.5)', 1.5)
+      // 基线音高（原唱）：允许画到未来，作为跟唱参考；不平滑
+      drawCurve(bp, tStart, tEnd, timeToX, h, 'rgba(99, 102, 241, 0.5)', 1.5, 'none')
 
       // 当前时间指示线
       const cursorX = timeToX(effectiveTime)
 
-      // 用户实时音高：中值平滑 + 静音断线
+      // 用户实时音高：只用过去点平滑 + 静音断线，
+      // 并硬限制最多画到「当前播放位置 + 小容差」，绝不提前画未来
+      const maxUserTime = effectiveTime + REALTIME_DRAW_AHEAD
       drawCurve(
-        up, tStart, tEnd, timeToX, h, '#ec4899', 2, true, USER_BREAK_GAP
+        up, tStart, tEnd, timeToX, h, '#ec4899', 2, 'past', USER_BREAK_GAP, maxUserTime
       )
 
       ctx.beginPath()

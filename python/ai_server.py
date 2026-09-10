@@ -111,7 +111,7 @@ async def serve_audio(path: str):
 @app.post("/api/separate", response_model=SeparateResponse)
 async def separate_vocals_api(req: SeparateRequest):
     """
-    伴奏分离 - Demucs (优先) 或 HPSS (fallback)
+    伴奏分离 - Demucs htdemucs 四轨分离，vocals 与 instrumental 分别输出（无 HPSS fallback）
     """
     cache_key = req.file_path
     if cache_key in _separation_cache:
