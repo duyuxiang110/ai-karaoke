@@ -1,5 +1,5 @@
 const { app, BrowserWindow, ipcMain, dialog, protocol, net } = require('electron')
-const { spawn } = require('child_process')
+const { spawn, execFileSync } = require('child_process')
 const path = require('path')
 const http = require('http')
 const fs = require('fs')
@@ -66,6 +66,77 @@ let appQuitting = false
 let pythonLastExit = null
 let pythonLastExe = null
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+function listPortListeners() {
+  try {
+    const out = execFileSync(
+      'lsof',
+      ['-ti', `tcp:${PYTHON_PORT}`, '-sTCP:LISTEN'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    )
+    return out
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+  } catch (err) {
+    // 没有监听者时 lsof 退出码非 0；lsof 不存在也走这里，
+    // 两种情况都当成「端口空闲」，行为跟没加这段逻辑时一致
+    return []
+  }
+}
+
+function processCommand(pid) {
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+  } catch (err) {
+    return ''
+  }
+}
+
+// 上一次运行遗留的 ai_server 会一直占着端口：新进程 bind 失败退出（exit 1），
+// 而 waitForPythonServer 只探 /health —— 孤儿进程回个 200 就被判成「已就绪」，
+// 界面从此一直跟旧代码对话，改了打分逻辑界面上一点变化都没有。
+// 所以 spawn 之前先回收端口，且只回收命令行里确认是我们自己 ai_server.py 的
+// 进程；别的应用正好用这个端口时不碰它，只把情况写进日志。
+async function reclaimPythonPort() {
+  const listeners = listPortListeners()
+  if (listeners.length === 0) return true
+
+  for (const pid of listeners) {
+    const command = processCommand(pid)
+    if (!command.includes('ai_server.py')) {
+      console.warn(
+        `[Electron] 端口 ${PYTHON_PORT} 被其它进程占用，未处理: pid=${pid} ${command}`
+      )
+      continue
+    }
+    console.log(`[Electron] 回收遗留的 AI 服务进程: pid=${pid}`)
+    try {
+      process.kill(Number(pid), 'SIGTERM')
+    } catch (err) {
+      console.error(`[Electron] 结束遗留进程失败 pid=${pid}: ${err.message}`)
+    }
+  }
+
+  // SIGTERM 之后 uvicorn 还要收尾，等端口真正空出来再 spawn，
+  // 否则新进程照样 bind 失败，白白烧掉一次重试机会
+  for (let i = 0; i < 20 && listPortListeners().length > 0; i++) {
+    await sleep(250)
+  }
+  return listPortListeners().length === 0
+}
+
+function schedulePythonRestart() {
+  setTimeout(async () => {
+    await reclaimPythonPort()
+    startPythonServer()
+  }, 2000)
+}
+
 function startPythonServer() {
   const { exe, script, cwd, env } = resolvePythonEnv()
   pythonSpawnCount++
@@ -107,7 +178,7 @@ function startPythonServer() {
     pythonProcess = null
     // 启动早期崩溃（端口被抢、瞬时失败等）自动重试，避免界面一直「AI 未连接」
     if (!appQuitting && code !== 0 && pythonSpawnCount < 3) {
-      setTimeout(startPythonServer, 2000)
+      schedulePythonRestart()
     }
   })
 
@@ -116,7 +187,7 @@ function startPythonServer() {
     if (pythonLogStream) pythonLogStream.write(`=== spawn error: ${err.message} ===\n`)
     pythonProcess = null
     if (!appQuitting && pythonSpawnCount < 3) {
-      setTimeout(startPythonServer, 2000)
+      schedulePythonRestart()
     }
   })
 }
@@ -273,6 +344,7 @@ app.whenReady().then(async () => {
     return net.fetch('file://' + filePath)
   })
 
+  await reclaimPythonPort()
   startPythonServer()
 
   try {

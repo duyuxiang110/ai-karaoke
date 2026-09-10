@@ -36,6 +36,11 @@ export interface PitchResult {
 export interface Score {
   total: number
   pitch: number
-  rhythm: number
+  /** 歌词没有可用时间轴时为 null，表示节奏未参评（不是 0 分） */
+  rhythm: number | null
   breath: number
+  /** 演唱完成度百分比，仅用于排查总分偏低的原因，界面不展示 */
+  completion?: number
+  /** 时间轴无效、或总分被完成度折算时的解释文案 */
+  warning?: string | null
 }

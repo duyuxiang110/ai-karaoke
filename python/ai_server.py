@@ -70,8 +70,15 @@ class ScoreRequest(BaseModel):
 class ScoreResponse(BaseModel):
     total: float
     pitch: float
-    rhythm: float
+    # 歌词没有可用时间轴时为 null，表示节奏未参评。
+    # 旧版把「音准+气息」的综合分塞进这一栏，界面上却写着「节奏」
+    rhythm: Optional[float] = None
     breath: float
+    # 演唱完成度（0~100）：总分 = 已唱内容质量 × 完成度。
+    # 界面不展示，但少了它无法解释总分到底为何偏低
+    completion: float = 0.0
+    # 时间轴无效、或总分被完成度折算时的解释文案
+    warning: Optional[str] = None
 
 
 # ─── REST 接口 ───
@@ -150,6 +157,28 @@ async def get_baseline(file_path: str, original_path: str = None, lrc_path: str 
     )
 
 
+def _log_score_input(req, result):
+    """把打分输入摘要写进日志：分数有争议时，光看输出反推不出输入形态
+
+    实测过一次「音准 11.6 / 节奏 9.3 / 气息 92.4 / 总分 0.9」，
+    四个数字本身分不清是算法错还是输入退化（时间戳没推进、只唱了两秒）。
+    帧数与时间跨度一摆出来就能直接定位。
+    """
+    try:
+        times = [float(p['time']) for p in req.user_pitches
+                 if isinstance(p, dict) and p.get('time') is not None]
+        span = max(times) - min(times) if times else 0.0
+    except (TypeError, ValueError):
+        span = -1.0
+    print(
+        f'[Score] user_frames={len(req.user_pitches)} span={span:.2f}s '
+        f'baseline_frames={len(req.baseline_pitches)} '
+        f'lyrics={len(req.lyric_timestamps or [])} '
+        f'onsets={len(req.user_onsets or [])} -> {result}',
+        flush=True,
+    )
+
+
 @app.post("/api/score", response_model=ScoreResponse)
 async def calculate_score(req: ScoreRequest):
     """最终打分"""
@@ -159,6 +188,7 @@ async def calculate_score(req: ScoreRequest):
         user_onsets=req.user_onsets,
         lyric_timestamps=req.lyric_timestamps,
     )
+    _log_score_input(req, result)
     return ScoreResponse(**result)
 
 

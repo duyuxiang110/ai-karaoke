@@ -779,6 +779,24 @@ body {
   color: var(--text-primary);
 }
 
+/* 节奏未参评：用中性色，不能套用低分的红色，否则看起来像被判了 0 分 */
+.breakdown-value.na {
+  color: var(--text-muted);
+  font-weight: 600;
+  cursor: help;
+}
+
+/* 解释总分为何被折算 / 时间轴为何无效 */
+.score-warning {
+  margin: -8px 0 14px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #92400e;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 8px;
+}
 /* ─── Scrollbar ─── */
 
 ::-webkit-scrollbar {

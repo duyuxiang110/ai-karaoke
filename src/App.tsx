@@ -39,6 +39,11 @@ function App() {
   const setProcessing = useKaraokeStore((s) => s.setProcessing)
   const clearUserPitches = useKaraokeStore((s) => s.clearUserPitches)
   const setScore = useKaraokeStore((s) => s.setScore)
+  const setPlaying = useKaraokeStore((s) => s.setPlaying)
+  // 打分的时间戳全部取自播放时钟，没有伴奏可播就不该开唱
+  const hasAudio = useKaraokeStore((s) =>
+    !!(s.isVocalPlayback ? s.vocalUrl : s.instrumentalUrl)
+  )
 
   const { start: startMic, stop: stopMic, error: micError } = useMicCapture()
   const { connect, disconnect, sendPCM } = usePitchStream(baseUrl)
@@ -176,16 +181,21 @@ function App() {
   const handleStartSinging = useCallback(async () => {
     clearUserPitches()
     setScore(null)
+    // 必须先让伴奏走起来：usePlaybackClock 在 isPlaying=false 时直接返回
+    // 冻结的 currentTime，不自动播放就开唱的话几百帧会全盖同一个时间戳，
+    // 后端既算不出完成度也对不上歌词，只能判 0 分
+    setPlaying(true)
     connect()
     await startMic(sendPCM)
-  }, [clearUserPitches, setScore, connect, startMic, sendPCM])
+  }, [clearUserPitches, setScore, setPlaying, connect, startMic, sendPCM])
 
   const handleStopSinging = useCallback(async () => {
     stopMic()
     disconnect()
+    setPlaying(false)
 
     setScoring(true)
-    const { userPitches, baselinePitches } = useKaraokeStore.getState()
+    const { userPitches, baselinePitches, lyrics } = useKaraokeStore.getState()
     try {
       const res = await fetch(`${baseUrl}/api/score`, {
         method: 'POST',
@@ -193,6 +203,8 @@ function App() {
         body: JSON.stringify({
           user_pitches: userPitches,
           baseline_pitches: baselinePitches,
+          // 歌词时间轴参与节奏评分与可演唱区间判定，不传的话节奏维度只能弃评
+          lyric_timestamps: lyrics,
         }),
       })
       const data = await res.json()
@@ -202,7 +214,7 @@ function App() {
     } finally {
       setScoring(false)
     }
-  }, [stopMic, disconnect, baseUrl, setScore])
+  }, [stopMic, disconnect, setPlaying, baseUrl, setScore])
 
   return (
     <div className="app">
@@ -265,7 +277,8 @@ function App() {
           <button
             className={`btn-sing ${isRecording ? 'recording' : ''}`}
             onClick={isRecording ? handleStopSinging : handleStartSinging}
-            disabled={!currentSong || scoring || isProcessing}
+            disabled={!currentSong || !hasAudio || scoring || isProcessing}
+            title={isRecording ? '结束演唱并打分' : '开始演唱（会自动播放伴奏，时间轴跟着伴奏走）'}
           >
             {scoring ? '⏳ 打分中...' : isRecording ? '⏹ 结束演唱' : '🎤 开始演唱'}
           </button>

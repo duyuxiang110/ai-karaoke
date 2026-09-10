@@ -60,22 +60,30 @@ export function ScoreRadar() {
     })
 
     // 得分多边形，颜色跟随总分
-    if (score) {
+    // 节奏未参评（null）的轴直接不参与作图：画到 0 会把「没得评」
+    // 显示成「这一项得了 0 分」，两者含义完全不同
+    const drawn = AXES.filter((axis) => score && score[axis.key] != null)
+    if (score && drawn.length > 0) {
       const totalColor = scoreColor(score.total)
-      ctx.beginPath()
-      AXES.forEach((axis, idx) => {
-        const value = score[axis.key] / 100
+      const points = drawn.map((axis) => {
+        const value = (score[axis.key] as number) / 100
         const r = radius * value
-        const x = cx + Math.cos(axis.angle) * r
-        const y = cy + Math.sin(axis.angle) * r
-        if (idx === 0) ctx.moveTo(x, y)
-        else ctx.lineTo(x, y)
+        return {
+          x: cx + Math.cos(axis.angle) * r,
+          y: cy + Math.sin(axis.angle) * r,
+        }
       })
-      ctx.closePath()
-      ctx.globalAlpha = 0.16
-      ctx.fillStyle = totalColor
-      ctx.fill()
-      ctx.globalAlpha = 1
+
+      ctx.beginPath()
+      points.forEach((p, idx) => (idx === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)))
+
+      if (points.length >= 3) {
+        ctx.closePath()
+        ctx.globalAlpha = 0.16
+        ctx.fillStyle = totalColor
+        ctx.fill()
+        ctx.globalAlpha = 1
+      }
       ctx.strokeStyle = totalColor
       ctx.lineWidth = 2.5
       ctx.stroke()
@@ -92,14 +100,19 @@ export function ScoreRadar() {
       const y = cy + Math.sin(axis.angle) * labelR
       ctx.fillText(axis.label, x, y)
 
-      if (score) {
-        const value = score[axis.key]
-        ctx.fillStyle = scoreColor(value)
-        ctx.font = 'bold 18px -apple-system, sans-serif'
-        ctx.fillText(value.toFixed(0), x, y + 17)
-        ctx.fillStyle = '#64748b'
+      if (!score) return
+      const value = score[axis.key]
+      if (value == null) {
+        ctx.fillStyle = '#94a3b8'
         ctx.font = '13px -apple-system, sans-serif'
+        ctx.fillText('未评', x, y + 17)
+        return
       }
+      ctx.fillStyle = scoreColor(value)
+      ctx.font = 'bold 18px -apple-system, sans-serif'
+      ctx.fillText(value.toFixed(0), x, y + 17)
+      ctx.fillStyle = '#64748b'
+      ctx.font = '13px -apple-system, sans-serif'
     })
 
     // 中心总分
